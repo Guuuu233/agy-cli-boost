@@ -1,0 +1,173 @@
+import { afterEach, describe, expect, it } from "bun:test"
+import fs from "node:fs"
+import path from "node:path"
+import {
+  conversationKey,
+  historyKey,
+  inspectToolTurn,
+  maxInitialPromptBytes,
+  SCIENCE_SYSTEM_COMPANION_RE,
+  stripToolUseInputs,
+  toolUseIdentitiesKey,
+} from "../src/protocol.mjs"
+import { CheckpointStore, CompletedTurnCache } from "../src/session-store.mjs"
+import { digest } from "../src/protocol.mjs"
+
+const TEST_TMP_ROOT = path.resolve(import.meta.dir, "..", ".tmp-tests")
+const createdDirs = []
+
+function makeTempDir(prefix) {
+  fs.mkdirSync(TEST_TMP_ROOT, { recursive: true })
+  const dir = fs.mkdtempSync(path.join(TEST_TMP_ROOT, prefix))
+  createdDirs.push(dir)
+  return dir
+}
+
+afterEach(() => {
+  while (createdDirs.length) {
+    const dir = createdDirs.pop()
+    try { fs.rmSync(dir, { recursive: true, force: true }) } catch {}
+  }
+})
+
+describe("protocol companion notices & budgets", () => {
+  it("recognizes Claude Science read_file pagination notices as non-steering companions", () => {
+    const notice = "[System] Showing lines 1320-1469 of 1761. Use offset=1320 to continue reading."
+    expect(SCIENCE_SYSTEM_COMPANION_RE.test(notice)).toBe(true)
+
+    const rawResults = [{
+      block: { type: "tool_result", tool_use_id: "toolu_1", content: "file content..." },
+      call: { id: "toolu_1", name: "read_file" },
+      result: { content: [{ type: "text", text: "file content..." }], isError: false },
+    }]
+    const body = {
+      messages: [
+        { role: "user", content: "Inspect index.mjs" },
+        { role: "assistant", content: [{ type: "tool_use", id: "toolu_1", name: "read_file", input: { path: "index.mjs" } }] },
+        {
+          role: "user",
+          content: [
+            { type: "tool_result", tool_use_id: "toolu_1", content: "file content..." },
+            { type: "text", text: notice },
+          ],
+        },
+      ],
+    }
+
+    const inspected = inspectToolTurn(rawResults, body)
+    expect(inspected.userSteered).toBe(false)
+    const joined = inspected.results[0].result.content.map((c) => c.text).join("\n")
+    expect(joined).toContain("file content...")
+    expect(joined).toContain(notice)
+  })
+
+  it("still detects genuine user steering beside tool_result", () => {
+    const rawResults = [{
+      block: { type: "tool_result", tool_use_id: "toolu_2", content: "ok" },
+      call: { id: "toolu_2", name: "read_file" },
+      result: { content: [{ type: "text", text: "ok" }], isError: false },
+    }]
+    const body = {
+      messages: [
+        { role: "user", content: "Inspect index.mjs" },
+        { role: "assistant", content: [{ type: "tool_use", id: "toolu_2", name: "read_file", input: { path: "index.mjs" } }] },
+        {
+          role: "user",
+          content: [
+            { type: "tool_result", tool_use_id: "toolu_2", content: "ok" },
+            { type: "text", text: "Stop reading that and check package.json instead." },
+          ],
+        },
+      ],
+    }
+    const inspected = inspectToolTurn(rawResults, body)
+    expect(inspected.userSteered).toBe(true)
+  })
+
+  it("uses larger initial prompt budget on agy >= 1.5.8", () => {
+    expect(maxInitialPromptBytes("1.5.8")).toBe(136 * 1024)
+    expect(maxInitialPromptBytes("1.5.7")).toBe(112 * 1024)
+    expect(maxInitialPromptBytes(null)).toBe(112 * 1024)
+  })
+})
+
+describe("CheckpointStore & CompletedTurnCache", () => {
+  it("persists non-destructively across reloads and isolates primary vs branch", () => {
+    const dir = makeTempDir("ckpt-")
+    const file = path.join(dir, "checkpoints.json")
+    const store1 = new CheckpointStore(file)
+
+    const primaryHistory = [
+      { role: "user", content: "Start long task" },
+      { role: "assistant", content: [{ type: "tool_use", id: "toolu_a", name: "bash", input: { cmd: "ls" } }] },
+    ]
+    const branchHistory = [
+      { role: "user", content: "Start long task" },
+    ]
+    const convKey = conversationKey({ messages: primaryHistory })
+    const instructionsHash = digest("system:main")
+
+    store1.upsert({
+      sessionId: "sess_primary",
+      convKey,
+      outerSession: "outer-1",
+      historyHash: digest(historyKey(primaryHistory)),
+      historyHashSansInputs: digest(historyKey(stripToolUseInputs(primaryHistory))),
+      toolUseIdentitiesHash: digest(toolUseIdentitiesKey(primaryHistory) ?? ""),
+      historyLength: primaryHistory.length,
+      instructionsHash,
+      workDir: "/tmp/proj",
+      model: "claude-opus-4-6-thinking",
+      role: "primary",
+    })
+    store1.upsert({
+      sessionId: "sess_branch",
+      convKey,
+      outerSession: "outer-1",
+      historyHash: digest(historyKey(branchHistory)),
+      historyHashSansInputs: digest(historyKey(stripToolUseInputs(branchHistory))),
+      toolUseIdentitiesHash: digest(toolUseIdentitiesKey(branchHistory) ?? ""),
+      historyLength: branchHistory.length,
+      instructionsHash,
+      workDir: "/tmp/proj",
+      model: "claude-opus-4-6-thinking",
+      role: "branch",
+    })
+
+    // Reload from disk in a second CheckpointStore instance.
+    const store2 = new CheckpointStore(file)
+    const primaryMatches1 = store2.findMatches({
+      convKey,
+      outerSession: "outer-1",
+      workDir: "/tmp/proj",
+      instructionsHash,
+      historyHash: digest(historyKey(primaryHistory)),
+      historyHashSansInputs: digest(historyKey(stripToolUseInputs(primaryHistory))),
+      toolUseIdentitiesHash: digest(toolUseIdentitiesKey(primaryHistory) ?? ""),
+    })
+    expect(primaryMatches1.map((m) => m.sessionId)).toEqual(["sess_primary"])
+
+    // Non-destructive: calling findMatches again still finds sess_primary!
+    const primaryMatches2 = store2.findMatches({
+      convKey,
+      outerSession: "outer-1",
+      workDir: "/tmp/proj",
+      instructionsHash,
+      historyHash: digest(historyKey(primaryHistory)),
+      historyHashSansInputs: digest(historyKey(stripToolUseInputs(primaryHistory))),
+      toolUseIdentitiesHash: digest(toolUseIdentitiesKey(primaryHistory) ?? ""),
+    })
+    expect(primaryMatches2.map((m) => m.sessionId)).toEqual(["sess_primary"])
+    expect(store2.hasPrimary(convKey, "outer-1")).toBe(true)
+
+    store2.invalidate("sess_primary")
+    expect(store2.hasPrimary(convKey, "outer-1")).toBe(false)
+  })
+
+  it("caches and deduplicates completed turns within TTL", () => {
+    const cache = new CompletedTurnCache(4, 10_000)
+    cache.set("k1", { content: [{ type: "text", text: "done" }], stopReason: "end_turn", usage: { input_tokens: 1, output_tokens: 1 } })
+    expect(cache.get("k1")?.content?.[0]?.text).toBe("done")
+    expect(cache.get("missing")).toBeNull()
+  })
+})

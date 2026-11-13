@@ -1,0 +1,44 @@
+{
+  "name": "magpie-agy-cli-boost",
+  "version": "0.1.0",
+  "description": "Persistent external daemon & multi-branch session-resume boost plugin for Antigravity CLI (agy acp) in Magpie/OpenCode — eliminates plugin-host GC drops, side-call collisions, and lossy 112 KiB history replays.",
+  "type": "module",
+  "main": "./opencode.mjs",
+  "exports": {
+    ".": "./opencode2.mjs",
+    "./server": "./opencode.mjs"
+  },
+  "files": [
+    "opencode.mjs",
+    "opencode2.mjs",
+    "src",
+    "README.md",
+    "README.zh-CN.md",
+    "LICENSE",
+    "NOTICE.md"
+  ],
+  "keywords": [
+    "magpie",
+    "magpie-plugin",
+    "opencode",
+    "opencode-plugin",
+    "antigravity",
+    "agy",
+    "acp"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Guuuu233/agy-cli-boost.git"
+  },
+  "homepage": "https://github.com/Guuuu233/agy-cli-boost#readme",
+  "bugs": {
+    "url": "https://github.com/Guuuu233/agy-cli-boost/issues"
+  },
+  "scripts": {
+    "test": "bun test"
+  },
+  "magpie": {
+    "maxConcurrency": 32
+  }
+}
