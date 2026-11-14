@@ -38,6 +38,7 @@ async function parseSseToJson(res) {
   const content = []
   const open = new Map()
   let stopReason = null
+  let usage = null
   for (const raw of blocks) {
     let ev = ""
     let data = ""
@@ -63,9 +64,10 @@ async function parseSseToJson(res) {
       content.push(b)
     } else if (ev === "message_delta") {
       stopReason = payload.delta?.stop_reason || stopReason
+      usage = payload.usage || usage
     }
   }
-  return { content, stop_reason: stopReason }
+  return { content, stop_reason: stopReason, usage }
 }
 
 afterEach(async () => {
@@ -634,6 +636,128 @@ describe("AgyBridge integration (mock agy ACP + daemon)", () => {
     expect(r3.status).toBe(200)
     const j3 = await parseSseToJson(r3)
     expect(j3.content[0].text).toContain("MAIN_REPLY:")
+    const events = readMockEvents(eventsFile)
+    expect(events.filter((e) => e.event === "session/new").length).toBe(1)
+  })
+
+  it("keeps stepUsageTrusted alive across transient missed steps and avoids 0.5x scale inflation on compacted sessions", async () => {
+    const dir = makeTempDir("compacted-usage-")
+    const convDir = path.join(dir, "conversations")
+    const eventsFile = path.join(dir, "mock-agy.jsonl")
+    const prevConvDir = process.env.AGY_BRIDGE_CONVERSATIONS_DIR
+    const prevGenDir = process.env.MOCK_AGY_GEN_DB_DIR
+    process.env.AGY_BRIDGE_CONVERSATIONS_DIR = convDir
+    process.env.MOCK_AGY_GEN_DB_DIR = convDir
+    process.env.MOCK_AGY_EVENTS_FILE = eventsFile
+    cleanups.push(async () => {
+      if (prevConvDir === undefined) delete process.env.AGY_BRIDGE_CONVERSATIONS_DIR
+      else process.env.AGY_BRIDGE_CONVERSATIONS_DIR = prevConvDir
+      if (prevGenDir === undefined) delete process.env.MOCK_AGY_GEN_DB_DIR
+      else process.env.MOCK_AGY_GEN_DB_DIR = prevGenDir
+    })
+
+    const daemon = await startDaemon({
+      stateDir: dir,
+      findAgy: () => MOCK_AGY,
+      skipSignInCheck: true,
+      skipInfoFile: true,
+      exitOnShutdown: false,
+    })
+    cleanups.push(() => daemon.shutdown())
+
+    const headers = {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${daemon.authKey}`,
+      "x-agy-hook-session": "ses_compact_1",
+      "x-cwd": "/tmp/demo-repo",
+    }
+    const tools = [
+      { name: "bash", description: "Bash", input_schema: { type: "object", properties: { path: { type: "string" } } } },
+    ]
+    // Large ~25K-token history to simulate a session that agy internally compacted down to 5K tokens.
+    const bigPad = "lorem ipsum dolor sit amet consectetur adipiscing elit ".repeat(1800)
+
+    // Turn 1: measured via gen_metadata -> 5,000 tokens (scale ≈ 0.20, well below old 0.50 clamp).
+    const r1 = await fetch(`http://127.0.0.1:${daemon.port}/v1/messages`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: "claude-opus-4-6-thinking",
+        max_tokens: 1024,
+        stream: true,
+        tools,
+        messages: [{ role: "user", content: `${bigPad}\nGEN_USAGE:500:4500:50 ACP_USAGE:5000:4500:50` }],
+      }),
+    })
+    const m1 = await parseSseToJson(r1)
+    expect(m1.usage.input_tokens + m1.usage.cache_read_input_tokens).toBe(5000)
+
+    // Turn 2: transient tool step misses gen_metadata -> falls back to #responseUsage.
+    // Must stay near calibrated ~5K (not spike to 0.5 * 25K = 12.5K!) and NOT poison stepUsageTrusted.
+    const r2 = await fetch(`http://127.0.0.1:${daemon.port}/v1/messages`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: "claude-opus-4-6-thinking",
+        max_tokens: 1024,
+        stream: true,
+        tools,
+        messages: [
+          { role: "user", content: `${bigPad}\nGEN_USAGE:500:4500:50 ACP_USAGE:5000:4500:50` },
+          { role: "assistant", content: m1.content },
+          { role: "user", content: "CALL_TOOL:bash SKIP_GEN_USAGE" },
+        ],
+      }),
+    })
+    const m2 = await parseSseToJson(r2)
+    const fallbackCtx = m2.usage.input_tokens + m2.usage.cache_read_input_tokens + m2.usage.cache_creation_input_tokens
+    expect(fallbackCtx).toBeLessThan(7500)
+
+    // Finish the tool turn (without GEN_USAGE -> fallback on end_turn too), then verify Turn 3 recovers!
+    const bashUse = m2.content.find((b) => b.name === "bash")
+    const r2b = await fetch(`http://127.0.0.1:${daemon.port}/v1/messages`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: "claude-opus-4-6-thinking",
+        max_tokens: 1024,
+        stream: true,
+        tools,
+        messages: [
+          { role: "user", content: `${bigPad}\nGEN_USAGE:500:4500:50 ACP_USAGE:5000:4500:50` },
+          { role: "assistant", content: m1.content },
+          { role: "user", content: "CALL_TOOL:bash SKIP_GEN_USAGE" },
+          { role: "assistant", content: m2.content },
+          { role: "user", content: [{ type: "tool_result", tool_use_id: bashUse.id, content: "ok" }] },
+        ],
+      }),
+    })
+    const m2b = await parseSseToJson(r2b)
+    expect(m2b.content[0].text).toContain("TOOL_OK:bash:ok")
+
+    // Turn 3 on the SAME proc: gen_metadata MUST still work (stepUsageTrusted stayed true)!
+    const r3 = await fetch(`http://127.0.0.1:${daemon.port}/v1/messages`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: "claude-opus-4-6-thinking",
+        max_tokens: 1024,
+        stream: true,
+        tools,
+        messages: [
+          { role: "user", content: `${bigPad}\nGEN_USAGE:500:4500:50 ACP_USAGE:5000:4500:50` },
+          { role: "assistant", content: m1.content },
+          { role: "user", content: "CALL_TOOL:bash SKIP_GEN_USAGE" },
+          { role: "assistant", content: m2.content },
+          { role: "user", content: [{ type: "tool_result", tool_use_id: bashUse.id, content: "ok" }] },
+          { role: "assistant", content: m2b.content },
+          { role: "user", content: "GEN_USAGE:600:5400:60 ACP_USAGE:6000:5400:60" },
+        ],
+      }),
+    })
+    const m3 = await parseSseToJson(r3)
+    expect(m3.usage.input_tokens).toBe(600)
+    expect(m3.usage.cache_read_input_tokens).toBe(5400)
     const events = readMockEvents(eventsFile)
     expect(events.filter((e) => e.event === "session/new").length).toBe(1)
   })

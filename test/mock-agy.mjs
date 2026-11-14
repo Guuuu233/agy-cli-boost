@@ -1,10 +1,58 @@
 #!/usr/bin/env bun
+import { Database } from "bun:sqlite"
 import fs from "node:fs"
 import net from "node:net"
 import path from "node:path"
 
 const args = process.argv.slice(2)
 const logFile = process.env.MOCK_AGY_EVENTS_FILE || ""
+const genDbDir = process.env.MOCK_AGY_GEN_DB_DIR || ""
+
+function varintBytes(n) {
+  const out = []
+  let v = Math.max(0, Math.floor(n))
+  while (v >= 0x80) {
+    out.push((v & 0x7f) | 0x80)
+    v = Math.floor(v / 128)
+  }
+  out.push(v & 0x7f)
+  return out
+}
+
+function lenField(fieldNum, bytes) {
+  return [...varintBytes((fieldNum << 3) | 2), ...varintBytes(bytes.length), ...bytes]
+}
+
+function intField(fieldNum, val) {
+  if (!val) return []
+  return [...varintBytes((fieldNum << 3) | 0), ...varintBytes(val)]
+}
+
+function encodeGenMetadata({ input = 0, output = 0, write = 0, read = 0, thinking = 0 }) {
+  const usage = [
+    ...intField(2, input),
+    ...intField(3, output),
+    ...intField(4, write),
+    ...intField(5, read),
+    ...intField(9, thinking),
+  ]
+  const chat = lenField(4, usage)
+  return Uint8Array.from(lenField(1, chat))
+}
+
+const genCounters = new Map()
+function writeGenMetadata(sid, usage) {
+  if (!genDbDir || !sid) return
+  fs.mkdirSync(genDbDir, { recursive: true })
+  const dbPath = path.join(genDbDir, `${sid}.db`)
+  const db = new Database(dbPath)
+  db.run("CREATE TABLE IF NOT EXISTS gen_metadata (idx INTEGER PRIMARY KEY, data BLOB)")
+  db.run("CREATE TABLE IF NOT EXISTS steps (idx INTEGER PRIMARY KEY, step_type INTEGER, status INTEGER, metadata BLOB)")
+  const nextIdx = (genCounters.get(sid) ?? -1) + 1
+  genCounters.set(sid, nextIdx)
+  db.prepare("INSERT INTO gen_metadata (idx, data) VALUES (?, ?)").run(nextIdx, encodeGenMetadata(usage))
+  db.close()
+}
 
 function record(event) {
   if (!logFile) return
@@ -76,12 +124,24 @@ async function handlePrompt(id, params) {
 
   try {
     // Trigger an MCP tool call if prompt asks for CALL_TOOL:<name>
+    const genMatch = /GEN_USAGE:(\d+):(\d+):(\d+)/.exec(promptText)
+    const acpUsageMatch = /ACP_USAGE:(\d+):(\d+):(\d+)/.exec(promptText)
+    const acpUsage = acpUsageMatch
+      ? { inputTokens: Number(acpUsageMatch[1]), cachedReadTokens: Number(acpUsageMatch[2]), outputTokens: Number(acpUsageMatch[3]) }
+      : { inputTokens: 50, cachedReadTokens: 40, outputTokens: 10 }
     const toolMatch = /CALL_TOOL:([A-Za-z0-9_:-]+)/.exec(promptText)
     if (toolMatch) {
       const toolName = toolMatch[1]
       const listRes = await controlCall("list")
       const toolNames = (listRes?.result?.tools || []).map((t) => t.name)
       record({ event: "mcp/list", sessionId: sid, tools: toolNames })
+      if (genMatch && !promptText.includes("SKIP_GEN_USAGE")) {
+        writeGenMetadata(sid, {
+          input: Number(genMatch[1]),
+          read: Number(genMatch[2]),
+          output: Number(genMatch[3]),
+        })
+      }
       const callRes = await controlCall("call", {
         name: toolName,
         arguments: { path: "demo.txt" },
@@ -95,6 +155,13 @@ async function handlePrompt(id, params) {
         return
       }
       const toolOutput = (callRes?.result?.content || []).map((c) => c.text).join("\n")
+      if (acpUsageMatch && !promptText.includes("SKIP_GEN_USAGE")) {
+        writeGenMetadata(sid, {
+          input: 120,
+          read: Number(genMatch?.[1] || 0) + Number(genMatch?.[2] || 0),
+          output: 20,
+        })
+      }
       send({
         jsonrpc: "2.0",
         method: "session/update",
@@ -111,13 +178,20 @@ async function handlePrompt(id, params) {
         id,
         result: {
           stopReason: "end_turn",
-          usage: { inputTokens: 100, cachedReadTokens: 80, outputTokens: 20 },
+          usage: acpUsageMatch ? acpUsage : { inputTokens: 100, cachedReadTokens: 80, outputTokens: 20 },
         },
       })
       return
     }
 
     const replyPrefix = promptText.includes("SIDE_CALL") ? "SIDE_REPLY" : "MAIN_REPLY"
+    if (genMatch && !promptText.includes("SKIP_GEN_USAGE")) {
+      writeGenMetadata(sid, {
+        input: Number(genMatch[1]),
+        read: Number(genMatch[2]),
+        output: Number(genMatch[3]),
+      })
+    }
     send({
       jsonrpc: "2.0",
       method: "session/update",
@@ -134,7 +208,7 @@ async function handlePrompt(id, params) {
       id,
       result: {
         stopReason: "end_turn",
-        usage: { inputTokens: 50, cachedReadTokens: 40, outputTokens: 10 },
+        usage: acpUsage,
       },
     })
   } finally {

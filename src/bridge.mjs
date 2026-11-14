@@ -121,7 +121,7 @@ const CONTROL_LINE_LIMIT = 16 * 1024 * 1024
 const ACP_LINE_LIMIT = 64 * 1024 * 1024
 const LOG_TAIL_BYTES = 256 * 1024
 const PING_INTERVAL_MS = 15_000
-const STEP_USAGE_WAIT_MS = 1_000
+const STEP_USAGE_WAIT_MS = 2_000
 const STEP_USAGE_SAME_GEN_WAIT_MS = 75
 const STEP_USAGE_POLL_MS = 25
 const TOOL_BATCH_WINDOW_MS = 30
@@ -542,7 +542,7 @@ class Turn {
     const total = usage.input_tokens + usage.cache_read_input_tokens + usage.cache_creation_input_tokens
     const estimate = this.stepInputEstimates[step.estimateIndex] || step.inputEstimate
     if (calibrate && total > 0) {
-      this.proc.inputTokenScale = Math.max(0.5, Math.min(1.5, total / estimate))
+      this.proc.inputTokenScale = Math.max(0.05, Math.min(1.5, total / estimate))
       this.proc.lastCacheRatio = Math.max(0, Math.min(1, usage.cache_read_input_tokens / total))
     }
   }
@@ -1929,10 +1929,20 @@ export class AgyBridge {
   async #settleUsage(proc, turn, step, content, result) {
     if (step.settled) return step.usage
     try {
-      const measured = result?.stopReason === "cancelled" ? null : await this.#measuredUsage(turn, step, content, result)
+      const cancelled = result?.stopReason === "cancelled"
+      const measured = cancelled ? null : await this.#measuredUsage(turn, step, content, result)
       if (measured) return measured
+      const reason = cancelled ? "cancelled" : (turn.lastMeasureMissReason || "unknown")
+      if (turn.stepsFile && proc.stepUsageObserved) {
+        this.logBridgeEvent(proc, turn, "model_usage_fallback", reason, {}, {
+          step_usage_observed: true,
+          last_context_tokens: proc.lastContextTokens || 0,
+        })
+      }
       turn.stepCursor = null
-      if (turn.stepsFile) proc.stepUsageTrusted = false
+      if (turn.stepsFile && !cancelled && !proc.stepUsageObserved) {
+        proc.stepUsageTrusted = false
+      }
       return this.#responseUsage(proc, turn, step, content, result)
     } finally {
       turn.sawGenerationOutput = false
@@ -1940,7 +1950,11 @@ export class AgyBridge {
   }
 
   async #measuredUsage(turn, step, content, result) {
-    if (step.settled || !turn.stepsFile || turn.stepCursor == null) return null
+    turn.lastMeasureMissReason = null
+    if (step.settled || !turn.stepsFile || turn.stepCursor == null) {
+      turn.lastMeasureMissReason = turn.stepCursor == null ? "no_cursor" : "no_steps_file"
+      return null
+    }
     const final = result !== undefined
     const acp = final && result?.usage ? promptUsage(result.usage) : null
     const measured = turn.measured || { prompt: 0 }
@@ -1951,7 +1965,10 @@ export class AgyBridge {
       if (expected === null) return true
       return promptOf(steps) >= expected
     }
-    if (!fs.existsSync(turn.stepsFile)) return null
+    if (!fs.existsSync(turn.stepsFile)) {
+      turn.lastMeasureMissReason = "no_db"
+      return null
+    }
     const sawOutput = turn.sawGenerationOutput ||
       (Array.isArray(content) && content.some((block) => block?.type === "text" || block?.type === "thinking"))
     const canShareGeneration = !final && !sawOutput && measured.prompt > 0 && turn.stepCursor.source !== null
@@ -1964,7 +1981,10 @@ export class AgyBridge {
       await new Promise((resolve) => setTimeout(resolve, STEP_USAGE_POLL_MS))
       batch = modelUsageAfter(turn.stepsFile, turn.stepCursor)
     }
-    if (!batch) return null
+    if (!batch) {
+      turn.lastMeasureMissReason = "batch_null"
+      return null
+    }
     const steps = batch.steps
     if (!complete(steps)) {
       if (!batch.pending && !steps?.length && (
@@ -1974,15 +1994,20 @@ export class AgyBridge {
           measured.prompt <= expected + Math.max(16, Math.ceil(expected * 0.01)))
       )) {
         if (final) turn.stepUsageReconciled = true
+        turn.proc.stepUsageObserved = true
         step.usageKind = "agy_same_generation"
         step.modelCalls = 0
         const ctx = tokenCount(turn.lastMeasuredContext || turn.proc.lastContextTokens || turn.stepInputEstimates[step.estimateIndex] || step.inputEstimate)
         return { input_tokens: 0, cache_read_input_tokens: ctx, cache_creation_input_tokens: 0, output_tokens: 0 }
       }
+      turn.lastMeasureMissReason = batch.pending ? "pending_timeout" : "incomplete"
       return null
     }
     const prompt = promptOf(steps)
-    if (expected !== null && prompt > expected + Math.max(16, Math.ceil(expected * 0.01))) return null
+    if (expected !== null && prompt > expected + Math.max(16, Math.ceil(expected * 0.01))) {
+      turn.lastMeasureMissReason = "expected_mismatch"
+      return null
+    }
     const last = steps.at(-1)
     const output = steps.reduce((sum, item) => sum + Math.max(item.output, item.thinking), 0)
     const thinking = steps.reduce((sum, item) => sum + item.thinking, 0)
@@ -1991,6 +2016,7 @@ export class AgyBridge {
       turn.lastMeasuredContext = ctx
       turn.proc.lastContextTokens = ctx
     }
+    turn.proc.stepUsageObserved = true
     turn.stepCursor = { source: batch.source, idx: last.idx }
     turn.measured = { prompt }
     if (final) turn.stepUsageReconciled = true
@@ -2026,7 +2052,7 @@ export class AgyBridge {
     if (single && translated) return translated
 
     const estimate = turn.stepInputEstimates[step.estimateIndex] || step.inputEstimate
-    const scale = Number.isFinite(proc.inputTokenScale) ? Math.max(0.5, Math.min(1.5, proc.inputTokenScale)) : 1
+    const scale = Number.isFinite(proc.inputTokenScale) ? Math.max(0.05, Math.min(1.5, proc.inputTokenScale)) : 1
     let cacheRatio = Number.isFinite(proc.lastCacheRatio) ? Math.max(0, Math.min(1, proc.lastCacheRatio)) : 0
     let input = Math.max(1, tokenCount(estimate * scale))
     let write = 0
@@ -2042,7 +2068,7 @@ export class AgyBridge {
         cacheRatio = totalInput > 0 ? parts.read / totalInput : 0
       }
       const combined = input + write
-      const bounded = Math.min(tokenCount(estimate * 1.5), combined)
+      const bounded = Math.min(Math.max(1, tokenCount(estimate * scale * 1.5)), combined)
       write = combined > 0 ? Math.min(bounded, tokenCount(bounded * (write / combined))) : 0
       input = bounded - write
     } else if (!Number.isFinite(proc.lastCacheRatio)) {
@@ -2060,7 +2086,9 @@ export class AgyBridge {
       ? Math.max(emitted.output, tokenCount((translated?.output_tokens || 0) - turn.emittedOutputTokens))
       : Math.max(1, emitted.output)
     const thinking = Math.min(output, emitted.thinking)
-    if (input + write > 0) proc.lastContextTokens = input + write
+    if (input + write > 0 && (!proc.stepUsageObserved || proc.lastContextTokens <= 0)) {
+      proc.lastContextTokens = input + write
+    }
     return {
       input_tokens: input - read,
       cache_read_input_tokens: read,
@@ -2346,6 +2374,7 @@ class Proc {
     this.lastContextTokens = 0
     this.omittedHistoryTokens = 0
     this.stepUsageTrusted = true
+    this.stepUsageObserved = false
     this.configOptions = []
     this.configMethodUnsupported = false
     this.currentSelectionKey = null
@@ -3041,7 +3070,7 @@ class Proc {
     }
     turn.cancelledMcpSockets.clear()
     turn.steering = false
-    if (turn.stepsFile && turn.promptCount > 0 && !turn.stepUsageReconciled) {
+    if (turn.stepsFile && turn.promptCount > 0 && !turn.stepUsageReconciled && !this.stepUsageObserved) {
       this.stepUsageTrusted = false
     }
     turn.detach()
