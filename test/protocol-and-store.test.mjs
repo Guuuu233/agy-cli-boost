@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from "bun:test"
 import fs from "node:fs"
 import path from "node:path"
 import {
+  collapsedHistoryKey,
   conversationKey,
   historyKey,
   inspectToolTurn,
@@ -88,6 +89,28 @@ describe("protocol companion notices & budgets", () => {
     expect(maxInitialPromptBytes("1.5.8")).toBe(136 * 1024)
     expect(maxInitialPromptBytes("1.5.7")).toBe(112 * 1024)
     expect(maxInitialPromptBytes(null)).toBe(112 * 1024)
+  })
+
+  it("canonicalizes gateway-collapsed server_tool_use / web_search_tool_result turns identically", () => {
+    const rawExpected = [
+      { role: "user", content: "Compare NegPy and FilmColor" },
+      { role: "assistant", content: [{ type: "tool_use", id: "toolu_ws1", name: "web_search", input: { query: "NegPy github" } }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_ws1", content: "{\"results\":[]}" }] },
+      { role: "assistant", content: [{ type: "tool_use", id: "toolu_bash1", name: "bash", input: { command: "uname -m" } }] },
+    ]
+    const clientCollapsed = [
+      { role: "user", content: "Compare NegPy and FilmColor" },
+      {
+        role: "assistant",
+        content: [
+          { type: "thinking", thinking: "Searching...", signature: "agyb1.abc" },
+          { type: "server_tool_use", id: "srvtoolu_1", name: "web_search", input: { query: "NegPy github" } },
+          { type: "web_search_tool_result", tool_use_id: "srvtoolu_1", content: [{ type: "web_search_result", url: "https://github.com/marcinz606/NegPy", title: "NegPy" }] },
+          { type: "tool_use", id: "toolu_bash1", name: "bash", input: { command: "uname -m" } },
+        ],
+      },
+    ]
+    expect(collapsedHistoryKey(rawExpected)).toBe(collapsedHistoryKey(clientCollapsed))
   })
 })
 

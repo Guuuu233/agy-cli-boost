@@ -28,6 +28,7 @@ import {
   BusyError,
   canonicalBody,
   canReplayFollowUpAfterResults,
+  collapsedHistoryKey,
   ConflictError,
   conversationKey,
   digest,
@@ -463,6 +464,7 @@ class Turn {
     this.accountedPrompts = new Set()
     this.stepUsageReconciled = false
     this.sawGenerationOutput = false
+    this.lastMeasuredContext = proc?.lastContextTokens || 0
     let settle
     this.settled = new Promise((resolve) => { settle = resolve })
     this.settle = settle
@@ -891,6 +893,8 @@ export class AgyBridge {
       outerSession: proc.outerSession || "",
       historyHash: digest(historyKey(proc.expectedMessages)),
       historyHashSansInputs: digest(historyKey(stripToolUseInputs(proc.expectedMessages))),
+      collapsedHistoryHash: digest(collapsedHistoryKey(proc.expectedMessages)),
+      collapsedHistoryHashSansInputs: digest(collapsedHistoryKey(stripToolUseInputs(proc.expectedMessages))),
       toolUseIdentitiesHash: digest(toolUseIdentitiesKey(proc.expectedMessages) ?? ""),
       historyLength: proc.expectedMessages.length,
       instructionsHash: digest(instructionsIdentity(proc.instructions)),
@@ -1381,8 +1385,20 @@ export class AgyBridge {
       }
     }
 
-    // 5. Try durable checkpoint resume! Never block resume just because historical tool_results exist.
-    const liveSessionIds = new Set([...this.allProcs].map((p) => p.sessionId).filter(Boolean))
+    // 5. Wait for any stopping/retiring procs of this conversation so agy releases session locks,
+    // and only exclude genuinely live procs from durable checkpoint resume.
+    const stoppingSameConv = [...this.allProcs].filter((p) =>
+      (p.stopping || p.retiring) && p.stopPromise &&
+      (p.convKey === convKey || (outerSession && p.outerSession === outerSession)))
+    if (stoppingSameConv.length) {
+      await Promise.all(stoppingSameConv.map((p) =>
+        Promise.race([p.stopPromise.catch(() => {}), new Promise((resolve) => setTimeout(resolve, 4_000))])))
+    }
+    const liveSessionIds = new Set(
+      [...this.allProcs]
+        .filter((p) => !p.dead && !p.stopping && !p.retiring && p.sessionId)
+        .map((p) => p.sessionId),
+    )
     let resumeCandidates = []
     if (!isFreshConversation && Array.isArray(opts.history) && opts.history.length > 0) {
       resumeCandidates = this.checkpoints.findMatches({
@@ -1392,6 +1408,8 @@ export class AgyBridge {
         instructionsHash: digest(instructionsIdentity(opts.instructions)),
         historyHash: digest(historyKey(opts.history)),
         historyHashSansInputs: digest(historyKey(stripToolUseInputs(opts.history))),
+        collapsedHistoryHash: digest(collapsedHistoryKey(opts.history)),
+        collapsedHistoryHashSansInputs: digest(collapsedHistoryKey(stripToolUseInputs(opts.history))),
         toolUseIdentitiesHash: digest(toolUseIdentitiesKey(opts.history) ?? ""),
         excludeSessionIds: liveSessionIds,
       })
@@ -1803,6 +1821,16 @@ export class AgyBridge {
           }
 
           if (needSteer || !historyMatches || proc.workDir !== workDir || !sameInstructions(proc.instructions, instructions)) {
+            this.logBridgeEvent(proc, turn, "drop_tool_turn",
+              needSteer ? "need_steer" : !historyMatches ? "history_mismatch" : proc.workDir !== workDir ? "workdir_mismatch" : "instructions_mismatch",
+              acquireOpts,
+              {
+                interrupted,
+                tools_grew: proc.toolsGrew(tools),
+                expected_len: proc.expectedMessages?.length ?? null,
+                incoming_len: trailing.history?.length ?? null,
+                history_invalid: !!proc.historyInvalid,
+              })
             this.#dropFromPool(proc)
             proc.abandonTurn(turn)
             await proc.stop()
@@ -1948,7 +1976,8 @@ export class AgyBridge {
         if (final) turn.stepUsageReconciled = true
         step.usageKind = "agy_same_generation"
         step.modelCalls = 0
-        return { input_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, output_tokens: 0 }
+        const ctx = tokenCount(turn.lastMeasuredContext || turn.proc.lastContextTokens || turn.stepInputEstimates[step.estimateIndex] || step.inputEstimate)
+        return { input_tokens: 0, cache_read_input_tokens: ctx, cache_creation_input_tokens: 0, output_tokens: 0 }
       }
       return null
     }
@@ -1957,6 +1986,11 @@ export class AgyBridge {
     const last = steps.at(-1)
     const output = steps.reduce((sum, item) => sum + Math.max(item.output, item.thinking), 0)
     const thinking = steps.reduce((sum, item) => sum + item.thinking, 0)
+    const ctx = tokenCount(last.input + last.read + last.write)
+    if (ctx > 0) {
+      turn.lastMeasuredContext = ctx
+      turn.proc.lastContextTokens = ctx
+    }
     turn.stepCursor = { source: batch.source, idx: last.idx }
     turn.measured = { prompt }
     if (final) turn.stepUsageReconciled = true
@@ -2026,6 +2060,7 @@ export class AgyBridge {
       ? Math.max(emitted.output, tokenCount((translated?.output_tokens || 0) - turn.emittedOutputTokens))
       : Math.max(1, emitted.output)
     const thinking = Math.min(output, emitted.thinking)
+    if (input + write > 0) proc.lastContextTokens = input + write
     return {
       input_tokens: input - read,
       cache_read_input_tokens: read,
@@ -2224,7 +2259,7 @@ export class AgyBridge {
               const usage = await this.#settleUsage(proc, turn, step, responseContent, event.result)
               if (finished) return
               const stopReason = STOP_REASONS[event.result.stopReason] || "end_turn"
-              stopMessage(stopReason, usage, true, event.result.stopReason !== "cancelled")
+              stopMessage(stopReason, usage, true, event.result.stopReason !== "cancelled" && step.usageKind !== "agy_same_generation")
               proc.recordAssistantResponse(turn, responseContent)
               if (replayKey && event.result.stopReason !== "cancelled") {
                 this.completedCache.set(replayKey, { content: responseContent, stopReason, usage })
@@ -2308,6 +2343,7 @@ class Proc {
     this.supportsImages = false
     this.inputTokenScale = 1
     this.lastCacheRatio = undefined
+    this.lastContextTokens = 0
     this.omittedHistoryTokens = 0
     this.stepUsageTrusted = true
     this.configOptions = []
@@ -2639,8 +2675,10 @@ class Proc {
     if (this.historyInvalid) return false
     if (this.expectedMessages == null) return !this.turn && !this.hasSentFirstTurn
     if (historyKey(this.expectedMessages) === historyKey(messages)) return true
-    return sameToolUseIdentities(this.expectedMessages, messages) &&
-      historyKey(stripToolUseInputs(this.expectedMessages)) === historyKey(stripToolUseInputs(messages))
+    if (sameToolUseIdentities(this.expectedMessages, messages) &&
+      historyKey(stripToolUseInputs(this.expectedMessages)) === historyKey(stripToolUseInputs(messages))) return true
+    if (collapsedHistoryKey(this.expectedMessages) === collapsedHistoryKey(messages)) return true
+    return collapsedHistoryKey(stripToolUseInputs(this.expectedMessages)) === collapsedHistoryKey(stripToolUseInputs(messages))
   }
 
   matchesPendingTurnHistory(turn, history) {
@@ -2650,7 +2688,10 @@ class Proc {
     while (split > 0 && history[split - 1].role === "assistant") split--
     let expectedSplit = this.expectedMessages.length
     while (expectedSplit > 0 && this.expectedMessages[expectedSplit - 1].role === "assistant") expectedSplit--
-    if (historyKey(this.expectedMessages.slice(0, expectedSplit)) !== historyKey(history.slice(0, split))) return false
+    const prefixMatches =
+      historyKey(this.expectedMessages.slice(0, expectedSplit)) === historyKey(history.slice(0, split)) ||
+      collapsedHistoryKey(this.expectedMessages.slice(0, expectedSplit)) === collapsedHistoryKey(history.slice(0, split))
+    if (!prefixMatches) return false
     const actualAssistant = history.slice(split)
     const expectedAssistant = this.expectedMessages.slice(expectedSplit)
     const actualCalls = lastAssistantCalls(actualAssistant)
@@ -2660,7 +2701,8 @@ class Proc {
       !call.id || call.id !== expectedCalls[index].id || call.name !== expectedCalls[index].name)) {
       return false
     }
-    return historyKey(stripToolUseInputs(expectedAssistant)) === historyKey(stripToolUseInputs(actualAssistant))
+    if (historyKey(stripToolUseInputs(expectedAssistant)) === historyKey(stripToolUseInputs(actualAssistant))) return true
+    return collapsedHistoryKey(stripToolUseInputs(expectedAssistant)) === collapsedHistoryKey(stripToolUseInputs(actualAssistant))
   }
 
   async steerInSession(turn, results, history) {

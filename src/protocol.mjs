@@ -369,6 +369,78 @@ export function historyKey(messages) {
   return stableJSON(rows.filter(row => row.content.length))
 }
 
+const GATEWAY_SERVER_TOOL_NAMES = new Set(["web_search", "web_search_prime", "webSearchPrime", "web_fetch", "fetch"])
+
+// Normalizes gateway-collapsed server-tool turns (e.g. Magpie collapsing
+// [assistant(...tool_use:web_search), user(tool_result), assistant(...)]
+// into a single assistant message containing server_tool_use + web_search_tool_result)
+// so both raw expectedMessages and collapsed client history hash identically.
+export function collapseServerToolHistory(messages) {
+  if (!Array.isArray(messages)) return messages
+  const collapsedIds = new Set()
+  const step1 = []
+  for (let i = 0; i < messages.length; i++) {
+    const msg = messages[i]
+    if (!msg || typeof msg !== "object") continue
+    const blocks = Array.isArray(msg.content) ? msg.content : [{ type: "text", text: msg.content ?? "" }]
+    if (msg.role === "assistant") {
+      const nextMsg = messages[i + 1]
+      const nextBlocks = nextMsg?.role === "user" && Array.isArray(nextMsg.content) ? nextMsg.content : null
+      const serverUses = blocks.filter((b) => b?.type === "tool_use" && GATEWAY_SERVER_TOOL_NAMES.has(b.name))
+      if (serverUses.length && nextBlocks && nextBlocks.length > 0 &&
+        nextBlocks.every((b) => b?.type === "tool_result" && serverUses.some((u) => u.id && u.id === b.tool_use_id))) {
+        for (const u of serverUses) collapsedIds.add(u.id)
+        const mapped = blocks.map((b) => {
+          if (b?.type === "tool_use" && GATEWAY_SERVER_TOOL_NAMES.has(b.name)) {
+            return { type: "gateway_server_tool", name: b.name, input: b.input ?? {} }
+          }
+          return b
+        })
+        step1.push({ ...msg, content: mapped })
+        i++ // skip the collapsed user tool_result message
+        continue
+      }
+      const mapped = []
+      for (const b of blocks) {
+        if (!b) continue
+        if (b.type === "server_tool_use") {
+          mapped.push({ type: "gateway_server_tool", name: b.name || "", input: b.input ?? {} })
+        } else if (SERVER_TOOL_RESULT_BLOCK_TYPES.has(b.type)) {
+          continue
+        } else {
+          mapped.push(b)
+        }
+      }
+      step1.push({ ...msg, content: mapped })
+      continue
+    }
+    if (msg.role === "user" && Array.isArray(msg.content)) {
+      const kept = msg.content.filter((b) => !(b?.type === "tool_result" && collapsedIds.has(b.tool_use_id)))
+      if (kept.length === 0) continue
+      step1.push({ ...msg, content: kept })
+      continue
+    }
+    step1.push(msg)
+  }
+  // Merge consecutive assistant messages created after stripping intermediate user tool_result rows.
+  const merged = []
+  for (const msg of step1) {
+    const prev = merged.at(-1)
+    if (prev && prev.role === "assistant" && msg.role === "assistant") {
+      const prevBlocks = Array.isArray(prev.content) ? prev.content : [{ type: "text", text: prev.content ?? "" }]
+      const curBlocks = Array.isArray(msg.content) ? msg.content : [{ type: "text", text: msg.content ?? "" }]
+      prev.content = [...prevBlocks, ...curBlocks]
+    } else {
+      merged.push({ ...msg })
+    }
+  }
+  return merged
+}
+
+export function collapsedHistoryKey(messages) {
+  return historyKey(collapseServerToolHistory(messages))
+}
+
 export function stripToolUseInputs(messages) {
   if (!Array.isArray(messages)) return messages
   return messages.map((message) => ({

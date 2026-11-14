@@ -545,4 +545,96 @@ describe("AgyBridge integration (mock agy ACP + daemon)", () => {
     const j2 = await parseSseToJson(r2)
     expect(j2.content[0].text).toContain(`MAIN_REPLY:${primarySid}:Streaming turn 2`)
   })
+
+  it("keeps live session when gateway collapses web_search into server_tool_use + web_search_tool_result", async () => {
+    const dir = makeTempDir("websearch-collapse-")
+    const eventsFile = path.join(dir, "mock-agy.jsonl")
+    process.env.MOCK_AGY_EVENTS_FILE = eventsFile
+
+    const daemon = await startDaemon({
+      stateDir: dir,
+      findAgy: () => MOCK_AGY,
+      skipSignInCheck: true,
+      skipInfoFile: true,
+      exitOnShutdown: false,
+    })
+    cleanups.push(() => daemon.shutdown())
+
+    const headers = {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${daemon.authKey}`,
+      "x-agy-hook-session": "ses_ws_1",
+      "x-cwd": "/tmp/demo-repo",
+    }
+    const tools = [
+      { name: "web_search", description: "Search", input_schema: { type: "object", properties: { path: { type: "string" } } } },
+      { name: "bash", description: "Bash", input_schema: { type: "object", properties: { path: { type: "string" } } } },
+    ]
+
+    // Step 1: agy emits web_search tool_use
+    const r1 = await fetch(`http://127.0.0.1:${daemon.port}/v1/messages`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: "claude-opus-4-6-thinking",
+        max_tokens: 1024,
+        stream: true,
+        tools,
+        messages: [{ role: "user", content: "Please CALL_TOOL:web_search" }],
+      }),
+    })
+    const m1 = await parseSseToJson(r1)
+    const wsUse = m1.content.find((b) => b.name === "web_search")
+    expect(wsUse).toBeTruthy()
+
+    // Step 2: gateway feeds web_search tool_result, agy replies with bash tool_use
+    const r2 = await fetch(`http://127.0.0.1:${daemon.port}/v1/messages`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: "claude-opus-4-6-thinking",
+        max_tokens: 1024,
+        stream: true,
+        tools,
+        messages: [
+          { role: "user", content: "Please CALL_TOOL:web_search" },
+          { role: "assistant", content: m1.content },
+          { role: "user", content: [{ type: "tool_result", tool_use_id: wsUse.id, content: "search hits" }] },
+          // In mock-agy, tool_result feeds back into the same turn which then finishes or calls another tool.
+        ],
+      }),
+    })
+    // Wait: mock-agy finishes with text after TOOL_OK, so verify collapsed history matches on the next user turn!
+    const m2 = await parseSseToJson(r2)
+    expect(m2.content[0].text).toContain("TOOL_OK:web_search:search hits")
+
+    // Step 3: Client sends gateway-collapsed history (server_tool_use + web_search_tool_result)
+    const r3 = await fetch(`http://127.0.0.1:${daemon.port}/v1/messages`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: "claude-opus-4-6-thinking",
+        max_tokens: 1024,
+        stream: true,
+        tools,
+        messages: [
+          { role: "user", content: "Please CALL_TOOL:web_search" },
+          {
+            role: "assistant",
+            content: [
+              { type: "server_tool_use", id: "srvtoolu_999", name: "web_search", input: wsUse.input },
+              { type: "web_search_tool_result", tool_use_id: "srvtoolu_999", content: [{ type: "web_search_result", url: "https://example.com", title: "Example" }] },
+              ...m2.content,
+            ],
+          },
+          { role: "user", content: "Follow up after collapsed web_search" },
+        ],
+      }),
+    })
+    expect(r3.status).toBe(200)
+    const j3 = await parseSseToJson(r3)
+    expect(j3.content[0].text).toContain("MAIN_REPLY:")
+    const events = readMockEvents(eventsFile)
+    expect(events.filter((e) => e.event === "session/new").length).toBe(1)
+  })
 })

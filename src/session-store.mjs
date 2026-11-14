@@ -129,6 +129,8 @@ export class CheckpointStore {
       outerSession: record.outerSession || prev?.outerSession || "",
       historyHash: record.historyHash,
       historyHashSansInputs: record.historyHashSansInputs || "",
+      collapsedHistoryHash: record.collapsedHistoryHash || "",
+      collapsedHistoryHashSansInputs: record.collapsedHistoryHashSansInputs || "",
       toolUseIdentitiesHash: record.toolUseIdentitiesHash || "",
       historyLength: Number.isFinite(record.historyLength) ? record.historyLength : 0,
       instructionsHash: record.instructionsHash,
@@ -182,10 +184,14 @@ export class CheckpointStore {
       if (!keyMatch) continue
       if ((entry.workDir ?? null) !== (query.workDir ?? null)) continue
       if (entry.instructionsHash !== query.instructionsHash) continue
-      const exact = entry.historyHash === query.historyHash
+      const exact = entry.historyHash === query.historyHash ||
+        (Boolean(query.collapsedHistoryHash) && Boolean(entry.collapsedHistoryHash) &&
+          entry.collapsedHistoryHash === query.collapsedHistoryHash)
       const sans = !exact && Boolean(query.toolUseIdentitiesHash) &&
         entry.toolUseIdentitiesHash === query.toolUseIdentitiesHash &&
-        entry.historyHashSansInputs === query.historyHashSansInputs
+        (entry.historyHashSansInputs === query.historyHashSansInputs ||
+          (Boolean(query.collapsedHistoryHashSansInputs) && Boolean(entry.collapsedHistoryHashSansInputs) &&
+            entry.collapsedHistoryHashSansInputs === query.collapsedHistoryHashSansInputs))
       if (!exact && !sans) continue
       out.push({ entry, exact })
     }
