@@ -5,6 +5,7 @@ import {
   collapsedHistoryKey,
   conversationKey,
   historyKey,
+  historyShapeDiff,
   inspectToolTurn,
   maxInitialPromptBytes,
   renderHistoryDeltaParts,
@@ -145,6 +146,34 @@ describe("protocol companion notices & budgets", () => {
       },
     ]
     expect(collapsedHistoryKey(rawExpected)).toBe(collapsedHistoryKey(clientCollapsed))
+  })
+
+  it("matches raw web_search turns against the history Magpie forwards with the search blocks removed", () => {
+    const opening = { role: "user", content: "Search, then record a note" }
+    const noteUse = { type: "tool_use", id: "toolu_note1", name: "record_note", input: { note: "Bun" } }
+    const rawExpected = [
+      opening,
+      { role: "assistant", content: [{ type: "thinking", thinking: "search first", signature: "agyb1.a" }, { type: "tool_use", id: "toolu_ws1", name: "web_search", input: { query: "Bun release" } }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_ws1", content: "hits 1" }] },
+      { role: "assistant", content: [{ type: "tool_use", id: "toolu_ws2", name: "web_search", input: { query: "Bun changelog" } }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_ws2", content: "hits 2" }] },
+      { role: "assistant", content: [noteUse] },
+    ]
+    const gatewayForwarded = [
+      opening,
+      { role: "assistant", content: [{ type: "thinking", thinking: "search first", signature: "agyb1.a" }, noteUse] },
+    ]
+    expect(historyKey(rawExpected)).not.toBe(historyKey(gatewayForwarded))
+    expect(collapsedHistoryKey(rawExpected)).toBe(collapsedHistoryKey(gatewayForwarded))
+
+    const differentNote = [opening, { role: "assistant", content: [{ ...noteUse, input: { note: "Deno" } }] }]
+    expect(collapsedHistoryKey(rawExpected)).not.toBe(collapsedHistoryKey(differentNote))
+
+    const diff = historyShapeDiff(rawExpected, gatewayForwarded)
+    expect(diff.common).toBe(1)
+    expect(diff.expected.length).toBe(5)
+    expect(diff.incoming.length).toBe(1)
+    expect(JSON.stringify(diff)).not.toContain("Bun")
   })
 
   it("canonicalizes tool signatures regardless of tool order or nested schema key order", () => {

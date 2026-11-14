@@ -371,10 +371,12 @@ export function historyKey(messages) {
 
 const GATEWAY_SERVER_TOOL_NAMES = new Set(["web_search", "web_search_prime", "webSearchPrime", "web_fetch", "fetch"])
 
-// Normalizes gateway-collapsed server-tool turns (e.g. Magpie collapsing
-// [assistant(...tool_use:web_search), user(tool_result), assistant(...)]
-// into a single assistant message containing server_tool_use + web_search_tool_result)
-// so both raw expectedMessages and collapsed client history hash identically.
+// Normalizes gateway-run server-tool turns. The bridge records them raw:
+// [assistant(...tool_use:web_search), user(tool_result), assistant(...)]. The
+// client sees one assistant message holding server_tool_use + web_search_tool_result,
+// and Magpie forwards that message upstream with both of those blocks removed
+// (observed 2026-11-15: the search leaves no trace in the request). So the search
+// call and its result are dropped from every form, and all three hash identically.
 export function collapseServerToolHistory(messages) {
   if (!Array.isArray(messages)) return messages
   const collapsedIds = new Set()
@@ -390,27 +392,12 @@ export function collapseServerToolHistory(messages) {
       if (serverUses.length && nextBlocks && nextBlocks.length > 0 &&
         nextBlocks.every((b) => b?.type === "tool_result" && serverUses.some((u) => u.id && u.id === b.tool_use_id))) {
         for (const u of serverUses) collapsedIds.add(u.id)
-        const mapped = blocks.map((b) => {
-          if (b?.type === "tool_use" && GATEWAY_SERVER_TOOL_NAMES.has(b.name)) {
-            return { type: "gateway_server_tool", name: b.name, input: b.input ?? {} }
-          }
-          return b
-        })
+        const mapped = blocks.filter((b) => !(b?.type === "tool_use" && GATEWAY_SERVER_TOOL_NAMES.has(b.name)))
         step1.push({ ...msg, content: mapped })
         i++ // skip the collapsed user tool_result message
         continue
       }
-      const mapped = []
-      for (const b of blocks) {
-        if (!b) continue
-        if (b.type === "server_tool_use") {
-          mapped.push({ type: "gateway_server_tool", name: b.name || "", input: b.input ?? {} })
-        } else if (SERVER_TOOL_RESULT_BLOCK_TYPES.has(b.type)) {
-          continue
-        } else {
-          mapped.push(b)
-        }
-      }
+      const mapped = blocks.filter((b) => b && b.type !== "server_tool_use" && !SERVER_TOOL_RESULT_BLOCK_TYPES.has(b.type))
       step1.push({ ...msg, content: mapped })
       continue
     }
@@ -439,6 +426,42 @@ export function collapseServerToolHistory(messages) {
 
 export function collapsedHistoryKey(messages) {
   return historyKey(collapseServerToolHistory(messages))
+}
+
+function blockShape(block) {
+  if (typeof block === "string") return `text(${block.length})`
+  if (!block || typeof block !== "object") return String(block)
+  const tag = (value) => digest(typeof value === "string" ? value : stableJSON(value ?? null)).slice(0, 8)
+  const idTag = (id) => typeof id === "string" ? id.slice(0, 6) + ":" + digest(id).slice(0, 6) : "-"
+  if (block.type === "text") return `text(${(block.text || "").length}:${tag((block.text || "").trim())})`
+  if (block.type === "thinking" || block.type === "redacted_thinking") return block.type
+  if (block.type === "tool_use" || block.type === "server_tool_use" || block.type === "mcp_tool_use") {
+    return `${block.type}[${block.name || ""} id=${idTag(block.id)} keys=${Object.keys(block.input ?? {}).sort().join(",")} in=${tag(block.input ?? {})}]`
+  }
+  if (block.type === "tool_result" || SERVER_TOOL_RESULT_BLOCK_TYPES.has(block.type)) {
+    const inner = Array.isArray(block.content)
+      ? block.content.map((part) => part?.type || typeof part).join(",")
+      : typeof block.content
+    return `${block.type}[id=${idTag(block.tool_use_id)} content=${inner}${block.is_error ? " error" : ""}]`
+  }
+  return String(block.type)
+}
+
+// Content-free description of where two histories part ways: the index of the
+// first message whose canonical form differs, then block types, tool names,
+// lengths and short digests of what follows on each side.
+export function historyShapeDiff(expected, incoming, limit = 12) {
+  if (!Array.isArray(expected) || !Array.isArray(incoming)) return null
+  const one = (message) => {
+    try { return historyKey([message]) } catch { return "!" + stableJSON(message?.role ?? null) }
+  }
+  let common = 0
+  while (common < expected.length && common < incoming.length && one(expected[common]) === one(incoming[common])) common++
+  const shape = (messages) => messages.slice(common, common + limit).map((message) => {
+    const blocks = Array.isArray(message?.content) ? message.content : [message?.content ?? ""]
+    return `${message?.role}: ${blocks.map(blockShape).join(" ")}`
+  })
+  return { common, expected: shape(expected), incoming: shape(incoming) }
 }
 
 export function stripToolUseInputs(messages) {

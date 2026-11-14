@@ -640,6 +640,68 @@ describe("AgyBridge integration (mock agy ACP + daemon)", () => {
     expect(events.filter((e) => e.event === "session/new").length).toBe(1)
   })
 
+  it("continues the pending tool turn when Magpie forwards history with the web_search blocks removed", async () => {
+    const dir = makeTempDir("websearch-stripped-")
+    const eventsFile = path.join(dir, "mock-agy.jsonl")
+    process.env.MOCK_AGY_EVENTS_FILE = eventsFile
+
+    const daemon = await startDaemon({
+      stateDir: dir,
+      findAgy: () => MOCK_AGY,
+      skipSignInCheck: true,
+      skipInfoFile: true,
+      exitOnShutdown: false,
+    })
+    cleanups.push(() => daemon.shutdown())
+
+    const post = (messages) => fetch(`http://127.0.0.1:${daemon.port}/v1/messages`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${daemon.authKey}`,
+        "x-agy-hook-session": "ses_ws_stripped",
+        "x-cwd": "/tmp/demo-repo",
+      },
+      body: JSON.stringify({
+        model: "claude-opus-4-6-thinking",
+        max_tokens: 1024,
+        stream: true,
+        tools: [
+          { name: "web_search", description: "Search", input_schema: { type: "object", properties: { path: { type: "string" } } } },
+          { name: "bash", description: "Bash", input_schema: { type: "object", properties: { path: { type: "string" } } } },
+        ],
+        messages,
+      }),
+    })
+    const opening = { role: "user", content: "Please CALL_TOOL:web_search THEN_TOOL:bash" }
+
+    // agy asks for the search; the gateway runs it and feeds the result back.
+    const m1 = await parseSseToJson(await post([opening]))
+    const wsUse = m1.content.find((b) => b.name === "web_search")
+    expect(wsUse).toBeTruthy()
+    const m2 = await parseSseToJson(await post([
+      opening,
+      { role: "assistant", content: m1.content },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: wsUse.id, content: "search hits" }] },
+    ]))
+    const bashUse = m2.content.find((b) => b.name === "bash")
+    expect(bashUse).toBeTruthy()
+
+    // The client answers bash; Magpie forwards the assistant turn without any trace of the search.
+    const r3 = await post([
+      opening,
+      { role: "assistant", content: m2.content },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: bashUse.id, content: "bash out" }] },
+    ])
+    expect(r3.status).toBe(200)
+    const m3 = await parseSseToJson(r3)
+    expect(m3.content.map((b) => b.text || "").join("")).toContain("TOOL_OK:web_search:search hits+bash out")
+
+    const events = readMockEvents(eventsFile)
+    expect(events.filter((e) => e.event === "session/new").length).toBe(1)
+    expect(events.filter((e) => e.event === "session/prompt").length).toBe(1)
+  })
+
   it("keeps stepUsageTrusted alive across transient missed steps and avoids 0.5x scale inflation on compacted sessions", async () => {
     const dir = makeTempDir("compacted-usage-")
     const convDir = path.join(dir, "conversations")

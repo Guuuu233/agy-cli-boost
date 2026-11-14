@@ -33,6 +33,7 @@ import {
   conversationKey,
   digest,
   estimateInputTokens,
+  historyShapeDiff,
   estimatePromptPartsTokens,
   estimateTextTokens,
   extractToolResults,
@@ -1935,6 +1936,7 @@ export class AgyBridge {
                 expected_len: proc.expectedMessages?.length ?? null,
                 incoming_len: trailing.history?.length ?? null,
                 history_invalid: !!proc.historyInvalid,
+                ...(!historyMatches ? { shape_diff: historyShapeDiff(proc.expectedMessages, trailing.history) } : {}),
               })
             if (historyMatches && !proc.historyInvalid) this.checkpointProc(proc)
             this.#dropFromPool(proc)

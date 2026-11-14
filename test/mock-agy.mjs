@@ -154,7 +154,13 @@ async function handlePrompt(id, params) {
         })
         return
       }
-      const toolOutput = (callRes?.result?.content || []).map((c) => c.text).join("\n")
+      let toolOutput = (callRes?.result?.content || []).map((c) => c.text).join("\n")
+      // THEN_TOOL:<name> chains a second MCP call inside the same agy turn.
+      const thenMatch = /THEN_TOOL:([A-Za-z0-9_:-]+)/.exec(promptText)
+      if (thenMatch) {
+        const thenRes = await controlCall("call", { name: thenMatch[1], arguments: { path: "then.txt" } })
+        toolOutput += "+" + (thenRes?.result?.content || []).map((c) => c.text).join("\n")
+      }
       if (acpUsageMatch && !promptText.includes("SKIP_GEN_USAGE")) {
         writeGenMetadata(sid, {
           input: 120,
