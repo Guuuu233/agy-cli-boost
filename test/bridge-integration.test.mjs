@@ -761,4 +761,330 @@ describe("AgyBridge integration (mock agy ACP + daemon)", () => {
     const events = readMockEvents(eventsFile)
     expect(events.filter((e) => e.event === "session/new").length).toBe(1)
   })
+
+  it("canonicalizes tool order/schema keys without emitting tools_changed", async () => {
+    const dir = makeTempDir("tools-canon-")
+    const eventsFile = path.join(dir, "mock-agy.jsonl")
+    process.env.MOCK_AGY_EVENTS_FILE = eventsFile
+
+    const daemon = await startDaemon({
+      stateDir: dir,
+      findAgy: () => MOCK_AGY,
+      skipSignInCheck: true,
+      skipInfoFile: true,
+      exitOnShutdown: false,
+    })
+    cleanups.push(() => daemon.shutdown())
+
+    const headers = {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${daemon.authKey}`,
+      "x-agy-hook-session": "ses_tools_canon",
+      "x-cwd": "/tmp/demo-repo",
+    }
+    const toolsA = [
+      { name: "bash", description: "Run shell", input_schema: { type: "object", required: ["path"], properties: { path: { type: "string" } } } },
+      { name: "read_file", description: "Read", input_schema: { type: "object", properties: { path: { type: "string" } } } },
+    ]
+    const toolsB = [
+      { name: "read_file", description: "Read", input_schema: { properties: { path: { type: "string" } }, type: "object" } },
+      { name: "bash", description: "Run shell", input_schema: { properties: { path: { type: "string" } }, required: ["path"], type: "object" } },
+    ]
+
+    const r1 = await fetch(`http://127.0.0.1:${daemon.port}/v1/messages`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: "claude-opus-4-6-thinking",
+        max_tokens: 1024,
+        stream: true,
+        tools: toolsA,
+        messages: [{ role: "user", content: "Please CALL_TOOL:bash" }],
+      }),
+    })
+    const m1 = await parseSseToJson(r1)
+    const bashUse = m1.content.find((b) => b.name === "bash")
+
+    const r2 = await fetch(`http://127.0.0.1:${daemon.port}/v1/messages`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: "claude-opus-4-6-thinking",
+        max_tokens: 1024,
+        stream: false,
+        tools: toolsB,
+        messages: [
+          { role: "user", content: "Please CALL_TOOL:bash" },
+          { role: "assistant", content: m1.content },
+          { role: "user", content: [{ type: "tool_result", tool_use_id: bashUse.id, content: "done" }] },
+        ],
+      }),
+    })
+    expect(r2.status).toBe(200)
+    const events = readMockEvents(eventsFile)
+    // Only the initial session/new mcp/list fires; tools_changed must NOT re-trigger mcp/list!
+    expect(events.filter((e) => e.event === "mcp/list").length).toBe(1)
+  })
+
+  it("rejects oversized requests with HTTP 413 request_too_large and x-should-retry: false", async () => {
+    const dir = makeTempDir("req-limit-")
+    const prevMax = process.env.AGY_BOOST_MAX_REQUEST_BYTES
+    process.env.AGY_BOOST_MAX_REQUEST_BYTES = "2048"
+    cleanups.push(async () => {
+      if (prevMax === undefined) delete process.env.AGY_BOOST_MAX_REQUEST_BYTES
+      else process.env.AGY_BOOST_MAX_REQUEST_BYTES = prevMax
+    })
+
+    const daemon = await startDaemon({
+      stateDir: dir,
+      findAgy: () => MOCK_AGY,
+      skipSignInCheck: true,
+      skipInfoFile: true,
+      exitOnShutdown: false,
+    })
+    cleanups.push(() => daemon.shutdown())
+
+    const r = await fetch(`http://127.0.0.1:${daemon.port}/v1/messages`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${daemon.authKey}`,
+      },
+      body: JSON.stringify({
+        model: "claude-opus-4-6-thinking",
+        max_tokens: 1024,
+        messages: [{ role: "user", content: "x".repeat(4096) }],
+      }),
+    })
+    expect(r.status).toBe(413)
+    expect(r.headers.get("x-should-retry")).toBe("false")
+    const err = await r.json()
+    expect(err.error?.type).toBe("invalid_request_error")
+    expect(err.error?.code).toBe("request_too_large")
+  })
+
+  it("resumes from a verified prefix checkpoint across restart when later turns diverge", async () => {
+    const dir = makeTempDir("prefix-resume-")
+    const eventsFile = path.join(dir, "mock-agy.jsonl")
+    process.env.MOCK_AGY_EVENTS_FILE = eventsFile
+
+    const daemon1 = await startDaemon({
+      stateDir: dir,
+      findAgy: () => MOCK_AGY,
+      skipSignInCheck: true,
+      exitOnShutdown: false,
+    })
+    const headers = {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${daemon1.authKey}`,
+      "x-agy-hook-session": "ses_prefix_1",
+      "x-cwd": "/tmp/demo-repo",
+    }
+
+    const r1 = await fetch(`http://127.0.0.1:${daemon1.port}/v1/messages`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: "claude-opus-4-6-thinking",
+        max_tokens: 1024,
+        stream: false,
+        messages: [{ role: "user", content: "Turn 1 hello" }],
+      }),
+    })
+    expect(r1.status).toBe(200)
+    const m1 = await r1.json()
+    const firstSid = /MAIN_REPLY:([^:]+):/.exec(m1.content[0].text)?.[1]
+    expect(firstSid).toBeTruthy()
+    await daemon1.shutdown()
+
+    // Restart daemon; client now sends an extra locally-appended turn in history after the checkpointed Turn 1.
+    const daemon2 = await startDaemon({
+      stateDir: dir,
+      findAgy: () => MOCK_AGY,
+      skipSignInCheck: true,
+      exitOnShutdown: false,
+    })
+    cleanups.push(() => daemon2.shutdown())
+
+    const r2 = await fetch(`http://127.0.0.1:${daemon2.port}/v1/messages`, {
+      method: "POST",
+      headers: { ...headers, Authorization: `Bearer ${daemon2.authKey}` },
+      body: JSON.stringify({
+        model: "claude-opus-4-6-thinking",
+        max_tokens: 1024,
+        stream: false,
+        messages: [
+          { role: "user", content: "Turn 1 hello" },
+          { role: "assistant", content: m1.content },
+          { role: "user", content: "Turn 2 edited offline" },
+          { role: "assistant", content: [{ type: "text", text: "Turn 2 offline reply" }] },
+          { role: "user", content: "Turn 3 after prefix" },
+        ],
+      }),
+    })
+    expect(r2.status).toBe(200)
+    const m2 = await r2.json()
+    expect(m2.content[0].text).toContain(`MAIN_REPLY:${firstSid}:`)
+
+    const events = readMockEvents(eventsFile)
+    expect(events.filter((e) => e.event === "session/new").length).toBe(1)
+    expect(events.some((e) => e.event === "session/resume" && e.sessionId === firstSid)).toBe(true)
+    const lastPrompt = events.filter((e) => e.event === "session/prompt").at(-1)?.promptText || ""
+    expect(lastPrompt).toContain("<continued_history_since_checkpoint>")
+    expect(lastPrompt).toContain("Turn 2 edited offline")
+  })
+
+  it("evicts 1-turn fresh procs before long-context primary procs under pool pressure", async () => {
+    const dir = makeTempDir("tiered-lru-")
+    const eventsFile = path.join(dir, "mock-agy.jsonl")
+    const prevMaxProcs = process.env.AGY_BOOST_MAX_PROCS
+    process.env.MOCK_AGY_EVENTS_FILE = eventsFile
+    process.env.AGY_BOOST_MAX_PROCS = "2"
+    cleanups.push(async () => {
+      if (prevMaxProcs === undefined) delete process.env.AGY_BOOST_MAX_PROCS
+      else process.env.AGY_BOOST_MAX_PROCS = prevMaxProcs
+    })
+
+    const daemon = await startDaemon({
+      stateDir: dir,
+      findAgy: () => MOCK_AGY,
+      skipSignInCheck: true,
+      skipInfoFile: true,
+      exitOnShutdown: false,
+    })
+    cleanups.push(() => daemon.shutdown())
+
+    const authHeader = { "Content-Type": "application/json", Authorization: `Bearer ${daemon.authKey}` }
+
+    // 1. Create a long-context primary proc (20+ messages) as oldest in the pool.
+    const longHistory = []
+    for (let i = 0; i < 10; i++) {
+      longHistory.push({ role: "user", content: `Long msg ${i}` })
+      longHistory.push({ role: "assistant", content: [{ type: "text", text: `Long reply ${i}` }] })
+    }
+    const rLong = await fetch(`http://127.0.0.1:${daemon.port}/v1/messages`, {
+      method: "POST",
+      headers: { ...authHeader, "x-agy-hook-session": "ses_long_1" },
+      body: JSON.stringify({
+        model: "claude-opus-4-6-thinking",
+        max_tokens: 1024,
+        stream: false,
+        messages: [...longHistory, { role: "user", content: "Long turn 1" }],
+      }),
+    })
+    expect(rLong.status).toBe(200)
+    const jLong = await rLong.json()
+    const longSid = /MAIN_REPLY:([^:]+):/.exec(jLong.content[0].text)?.[1]
+
+    // 2. Create a newer 1-turn fresh proc (pool now full at 2).
+    const rFresh = await fetch(`http://127.0.0.1:${daemon.port}/v1/messages`, {
+      method: "POST",
+      headers: { ...authHeader, "x-agy-hook-session": "ses_fresh_1" },
+      body: JSON.stringify({
+        model: "claude-opus-4-6-thinking",
+        max_tokens: 1024,
+        stream: false,
+        messages: [{ role: "user", content: "Fresh 1-turn ping" }],
+      }),
+    })
+    expect(rFresh.status).toBe(200)
+
+    // 3. Create a 3rd conversation -> must evict the 1-turn fresh proc, NOT the older long-context primary!
+    const rThird = await fetch(`http://127.0.0.1:${daemon.port}/v1/messages`, {
+      method: "POST",
+      headers: { ...authHeader, "x-agy-hook-session": "ses_third_1" },
+      body: JSON.stringify({
+        model: "claude-opus-4-6-thinking",
+        max_tokens: 1024,
+        stream: false,
+        messages: [{ role: "user", content: "Third conversation" }],
+      }),
+    })
+    expect(rThird.status).toBe(200)
+
+    // 4. Follow-up on the long-context primary MUST still reuse its live session without session/new or session/resume!
+    const resumesBefore = readMockEvents(eventsFile).filter((e) => e.event === "session/resume").length
+    const rLong2 = await fetch(`http://127.0.0.1:${daemon.port}/v1/messages`, {
+      method: "POST",
+      headers: { ...authHeader, "x-agy-hook-session": "ses_long_1" },
+      body: JSON.stringify({
+        model: "claude-opus-4-6-thinking",
+        max_tokens: 1024,
+        stream: false,
+        messages: [
+          ...longHistory,
+          { role: "user", content: "Long turn 1" },
+          { role: "assistant", content: jLong.content },
+          { role: "user", content: "Long turn 2" },
+        ],
+      }),
+    })
+    expect(rLong2.status).toBe(200)
+    const jLong2 = await rLong2.json()
+    expect(jLong2.content[0].text).toContain(`MAIN_REPLY:${longSid}:Long turn 2`)
+    const resumesAfter = readMockEvents(eventsFile).filter((e) => e.event === "session/resume").length
+    expect(resumesAfter).toBe(resumesBefore)
+  })
+
+  it("retires obsolete 1-turn fresh procs instead of piling up duplicate slots", async () => {
+    const dir = makeTempDir("fresh-cleanup-")
+    const daemon = await startDaemon({
+      stateDir: dir,
+      findAgy: () => MOCK_AGY,
+      skipSignInCheck: true,
+      skipInfoFile: true,
+      exitOnShutdown: false,
+    })
+    cleanups.push(() => daemon.shutdown())
+
+    const headers = {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${daemon.authKey}`,
+      "x-agy-hook-session": "ses_fresh_pileup",
+    }
+
+    // Repeated fresh requests with the same convKey (varying tools so CompletedTurnCache misses)
+    // must retire the obsolete 1-turn proc instead of keeping multiple slots for the same convKey.
+    for (let i = 0; i < 3; i++) {
+      const res = await fetch(`http://127.0.0.1:${daemon.port}/v1/messages`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          model: "claude-opus-4-6-thinking",
+          max_tokens: 1024,
+          stream: false,
+          tools: [{ name: `tool_${i}`, description: "t", input_schema: { type: "object", properties: {} } }],
+          messages: [{ role: "user", content: "Same fresh convKey ping" }],
+        }),
+      })
+      expect(res.status).toBe(200)
+    }
+
+    let healthRes = await fetch(`http://127.0.0.1:${daemon.port}/health`, {
+      headers: { Authorization: `Bearer ${daemon.authKey}` },
+    })
+    let health = await healthRes.json()
+    expect(health.poolSize).toBe(1)
+
+    // Multiple distinct fresh conversations in the same outerSession are capped rather than piling up unboundedly.
+    for (let i = 0; i < 5; i++) {
+      const res = await fetch(`http://127.0.0.1:${daemon.port}/v1/messages`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          model: "claude-opus-4-6-thinking",
+          max_tokens: 1024,
+          stream: false,
+          messages: [{ role: "user", content: `Distinct fresh ping ${i}` }],
+        }),
+      })
+      expect(res.status).toBe(200)
+    }
+
+    healthRes = await fetch(`http://127.0.0.1:${daemon.port}/health`, {
+      headers: { Authorization: `Bearer ${daemon.authKey}` },
+    })
+    health = await healthRes.json()
+    expect(health.poolSize).toBeLessThanOrEqual(3)
+  })
 })

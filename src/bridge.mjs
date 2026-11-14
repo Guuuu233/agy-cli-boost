@@ -53,6 +53,7 @@ import {
   promptHasImage,
   promptTextBytes,
   renderContinuedTurnParts,
+  renderHistoryDeltaParts,
   renderInitialPromptParts,
   replayHistoryProblem,
   requestLayout,
@@ -64,6 +65,7 @@ import {
   stripToolUseInputs,
   systemText,
   toolResult,
+  toolsSignature,
   toolUseIdentitiesKey,
   toPromptParts,
   trailingMessages,
@@ -90,6 +92,16 @@ function configuredTimeout(name, fallback) {
 }
 
 const IDLE_MS = () => positiveTimeout(process.env.AGY_BOOST_IDLE_MS || process.env.AGY_BRIDGE_IDLE_MS, 30 * 60 * 1000)
+const FRESH_IDLE_MS = () => positiveTimeout(
+  process.env.AGY_BOOST_FRESH_IDLE_MS,
+  Math.min(IDLE_MS(), 5 * 60 * 1000),
+)
+const LONG_IDLE_MS = () => positiveTimeout(
+  process.env.AGY_BOOST_LONG_IDLE_MS,
+  Object.hasOwn(process.env, "AGY_BOOST_IDLE_MS") || Object.hasOwn(process.env, "AGY_BRIDGE_IDLE_MS")
+    ? IDLE_MS()
+    : 60 * 60 * 1000,
+)
 const MAX_PROCS = () => positiveTimeout(process.env.AGY_BOOST_MAX_PROCS || process.env.AGY_BRIDGE_MAX_PROCS, 24)
 const DETACHED_EVICT_MS = () => positiveTimeout(process.env.AGY_BOOST_DETACHED_EVICT_MS || process.env.AGY_BRIDGE_DETACHED_EVICT_MS, 15 * 60 * 1000)
 const TURN_TIMEOUT_MS = () => positiveTimeout(process.env.AGY_BOOST_TURN_TIMEOUT_MS || process.env.AGY_BRIDGE_TURN_TIMEOUT_MS, 5 * 60 * 1000)
@@ -101,12 +113,16 @@ const MCP_COMMIT_WAIT_MS = () => {
     const parsed = Number(raw)
     if (Number.isFinite(parsed) && parsed >= 0) return Math.min(Math.floor(parsed), 60_000)
   }
-  return 5_000
+  return 12_000
 }
 
 const DEFAULT_PROC_START_TIMEOUT_MS = 60_000
 const CANCEL_SETTLE_MS = 15_000
 const RECLAIM_STOP_TIMEOUT_MS = 10_000
+const LONG_CONTEXT_MSG_THRESHOLD = 20
+const LONG_CONTEXT_TOKEN_THRESHOLD = 32_000
+const MAX_PREFIX_DELTA_MESSAGES = 16
+const MAX_PREFIX_DELTA_BYTES = 96 * 1024
 const NO_PROGRESS_REPEAT_LIMIT = 3
 const NO_PROGRESS_REPEAT_WINDOW_MS = 10 * 60 * 1000
 const NO_PROGRESS_REPEAT_MAX_ENTRIES = 256
@@ -213,7 +229,7 @@ export function jsonError(status, message, code, { extra, headers, noRetry = fal
     JSON.stringify({
       type: "error",
       error: {
-        type: status === 400 ? "invalid_request_error" : "api_error",
+        type: status === 400 || status === 413 ? "invalid_request_error" : "api_error",
         ...(code ? { code } : {}),
         message: String(message || "unknown error"),
         ...(extra ?? {}),
@@ -223,7 +239,7 @@ export function jsonError(status, message, code, { extra, headers, noRetry = fal
       status,
       headers: {
         "Content-Type": "application/json",
-        ...(status === 400 && noRetry ? NO_RETRY_HEADERS : {}),
+        ...((status === 400 || status === 413) && noRetry ? NO_RETRY_HEADERS : {}),
         ...(headers ?? {}),
       },
     },
@@ -1127,14 +1143,34 @@ export class AgyBridge {
     } finally { clearTimeout(timer) }
   }
 
+  #isFreshShortProc(proc) {
+    return (proc.expectedMessages?.length ?? 0) <= 2 && (proc.lastContextTokens || 0) < LONG_CONTEXT_TOKEN_THRESHOLD
+  }
+
+  #isLongContextProc(proc) {
+    return (proc.expectedMessages?.length ?? 0) >= LONG_CONTEXT_MSG_THRESHOLD ||
+      (proc.lastContextTokens || 0) >= LONG_CONTEXT_TOKEN_THRESHOLD
+  }
+
+  #procIdleMs(proc) {
+    if (this.#isFreshShortProc(proc)) return FRESH_IDLE_MS()
+    if (this.#isLongContextProc(proc)) return LONG_IDLE_MS()
+    return IDLE_MS()
+  }
+
+  #procEvictRank(proc) {
+    if (this.#isFreshShortProc(proc)) return proc.role === "branch" ? 0 : 1
+    if (!this.#isLongContextProc(proc)) return proc.role === "branch" ? 2 : 3
+    return proc.role === "branch" ? 4 : 5
+  }
+
   async evictIdle() {
     const now = Date.now()
-    const cutoff = now - IDLE_MS()
     const victims = []
     const stale = []
     for (const proc of this.pool.values()) {
       if (proc.retiring) continue
-      if (proc.dead || (!proc.turn && proc.lastUsed < cutoff)) victims.push(proc)
+      if (proc.dead || (!proc.turn && proc.lastUsed < now - this.#procIdleMs(proc))) victims.push(proc)
       else if (proc.turn) {
         const verdict = this.#staleTurnVerdict(proc, proc.turn, now)
         if (verdict.stale) stale.push({ proc, turn: proc.turn, reason: verdict.reason })
@@ -1149,19 +1185,16 @@ export class AgyBridge {
   }
 
   async #evictLRU() {
-    // 1. Prefer retiring idle branch procs before idle primary procs.
+    // 1. Retire idle procs by cost tier: 1-turn fresh -> branch -> normal primary -> long-context primary.
     let oldest = null
+    let oldestRank = Infinity
     for (const proc of this.pool.values()) {
       if (proc.turn || proc.retiring) continue
-      if (!oldest) {
+      const rank = this.#procEvictRank(proc)
+      if (!oldest || rank < oldestRank || (rank === oldestRank && proc.lastUsed < oldest.lastUsed)) {
         oldest = proc
-        continue
+        oldestRank = rank
       }
-      if (oldest.role !== proc.role) {
-        if (proc.role === "branch") oldest = proc
-        continue
-      }
-      if (proc.lastUsed < oldest.lastUsed) oldest = proc
     }
     if (oldest) {
       await this.#retireProc(oldest)
@@ -1371,6 +1404,25 @@ export class AgyBridge {
     // 4. Determine whether this new Proc is a "branch" (side-call) or "primary".
     const role = isolateBranch ? "branch" : "primary"
 
+    // Retire obsolete 1-turn idle procs for the same fresh conversation (or excess 1-turn procs
+    // in the same outerSession) instead of letting fresh side-calls pile up as history_diverged.
+    if (isFreshConversation) {
+      const sameConvFresh = candidates.filter((p) =>
+        !p.dead && !p.retiring && !p.turn && p.convKey === convKey && this.#isFreshShortProc(p))
+      for (const obsolete of sameConvFresh) {
+        await this.#retireProc(obsolete)
+      }
+      if (outerSession) {
+        const remainingFresh = this.#procsForConversation(convKey, outerSession)
+          .filter((p) => !p.dead && !p.retiring && !p.turn && this.#isFreshShortProc(p))
+          .sort((a, b) => b.lastUsed - a.lastUsed)
+        for (const excess of remainingFresh.slice(2)) {
+          await this.#retireProc(excess)
+        }
+      }
+      candidates = this.#procsForConversation(convKey, outerSession)
+    }
+
     // Check if an active primary turn blocks a new primary request on the exact same thread.
     if (role === "primary") {
       const busyPrimary = candidates.find((p) => !p.dead && !p.retiring && p.turn && p.role === "primary")
@@ -1399,13 +1451,15 @@ export class AgyBridge {
         .filter((p) => !p.dead && !p.stopping && !p.retiring && p.sessionId)
         .map((p) => p.sessionId),
     )
+    const instructionsHash = digest(instructionsIdentity(opts.instructions))
     let resumeCandidates = []
+    let prefixCandidates = []
     if (!isFreshConversation && Array.isArray(opts.history) && opts.history.length > 0) {
       resumeCandidates = this.checkpoints.findMatches({
         convKey,
         outerSession,
         workDir: opts.workDir ?? null,
-        instructionsHash: digest(instructionsIdentity(opts.instructions)),
+        instructionsHash,
         historyHash: digest(historyKey(opts.history)),
         historyHashSansInputs: digest(historyKey(stripToolUseInputs(opts.history))),
         collapsedHistoryHash: digest(collapsedHistoryKey(opts.history)),
@@ -1413,24 +1467,67 @@ export class AgyBridge {
         toolUseIdentitiesHash: digest(toolUseIdentitiesKey(opts.history) ?? ""),
         excludeSessionIds: liveSessionIds,
       })
+      if (!resumeCandidates.length && opts.history.length > 1) {
+        const rawPrefixes = this.checkpoints.findPrefixCandidates({
+          convKey,
+          outerSession,
+          workDir: opts.workDir ?? null,
+          instructionsHash,
+          historyLength: opts.history.length,
+          excludeSessionIds: liveSessionIds,
+        })
+        for (const candidate of rawPrefixes) {
+          if (candidate.role !== role) continue
+          const deltaLen = opts.history.length - candidate.historyLength
+          if (deltaLen < 1 || deltaLen > MAX_PREFIX_DELTA_MESSAGES) continue
+          const prefixSlice = opts.history.slice(0, candidate.historyLength)
+          const exactPrefix = digest(historyKey(prefixSlice)) === candidate.historyHash ||
+            (Boolean(candidate.collapsedHistoryHash) && digest(collapsedHistoryKey(prefixSlice)) === candidate.collapsedHistoryHash)
+          const sansPrefix = !exactPrefix && Boolean(candidate.toolUseIdentitiesHash) &&
+            digest(toolUseIdentitiesKey(prefixSlice) ?? "") === candidate.toolUseIdentitiesHash &&
+            (digest(historyKey(stripToolUseInputs(prefixSlice))) === candidate.historyHashSansInputs ||
+              (Boolean(candidate.collapsedHistoryHashSansInputs) &&
+                digest(collapsedHistoryKey(stripToolUseInputs(prefixSlice))) === candidate.collapsedHistoryHashSansInputs))
+          if (!exactPrefix && !sansPrefix) continue
+          const deltaMessages = opts.history.slice(candidate.historyLength)
+          if (utf8Bytes(JSON.stringify(deltaMessages)) > MAX_PREFIX_DELTA_BYTES) continue
+          prefixCandidates.push({ candidate, expectedMessages: prefixSlice, prefixLength: candidate.historyLength })
+        }
+      }
     }
 
+    const attempts = [
+      ...resumeCandidates.map((candidate) => ({
+        sessionId: candidate.sessionId,
+        expectedMessages: opts.history,
+        prefixLength: null,
+      })),
+      ...prefixCandidates.map((item) => ({
+        sessionId: item.candidate.sessionId,
+        expectedMessages: item.expectedMessages,
+        prefixLength: item.prefixLength,
+      })),
+    ]
+
     let proc = null
-    for (const candidate of resumeCandidates) {
+    let prefixResumeLen = null
+    for (let i = 0; i < attempts.length; i++) {
+      const attempt = attempts[i]
       const attemptProc = new Proc(this, agyPath, convKey, {
         ...opts,
         role,
-        resume: { sessionId: candidate.sessionId, expectedMessages: opts.history },
+        resume: { sessionId: attempt.sessionId, expectedMessages: attempt.expectedMessages },
       })
       try {
         await attemptProc.start()
         if (attemptProc.resumed) {
           proc = attemptProc
+          prefixResumeLen = attempt.prefixLength
           break
         }
         // agy rejected session/resume -> invalidate stale checkpoint & stop attemptProc if another exists
-        this.checkpoints.invalidate(candidate.sessionId)
-        if (resumeCandidates.length > 1) {
+        this.checkpoints.invalidate(attempt.sessionId)
+        if (i + 1 < attempts.length) {
           await attemptProc.stop().catch(() => {})
           continue
         }
@@ -1438,7 +1535,7 @@ export class AgyBridge {
         break
       } catch (error) {
         await attemptProc.stop().catch(() => {})
-        this.checkpoints.invalidate(candidate.sessionId)
+        this.checkpoints.invalidate(attempt.sessionId)
       }
     }
 
@@ -1455,24 +1552,27 @@ export class AgyBridge {
     this.pool.set(proc.slotKey, proc)
     if (proc.resumed) {
       this.stats.resumedCount++
-      this.logSessionEvent(proc, "session_resumed", "checkpoint_resume", {
+      this.logSessionEvent(proc, "session_resumed", prefixResumeLen != null ? "prefix_checkpoint_resume" : "checkpoint_resume", {
         fresh: !!isFreshConversation,
         history: Array.isArray(opts.history) ? opts.history.length : null,
+        ...(prefixResumeLen != null ? { prefix_len: prefixResumeLen } : {}),
       })
     } else {
       this.stats.newSessionCount++
       if (role === "branch") this.stats.branchIsolatedCount++
       const why = role === "branch"
         ? "branch_isolated"
-        : candidates.length ? "history_diverged" : "no_live"
+        : isFreshConversation
+          ? "fresh_session"
+          : candidates.length ? "history_diverged" : "no_live"
       this.logSessionEvent(proc, "session_new", why, {
         fresh: !!isFreshConversation,
         resumed: false,
-        parked: resumeCandidates.length > 0,
+        parked: attempts.length > 0,
         history: Array.isArray(opts.history) ? opts.history.length : null,
       })
     }
-    return { proc, history: opts.history }
+    return { proc, history: opts.history, prefixResumeLen }
   }
 
   #matchToolResults(body, blocks) {
@@ -1551,15 +1651,20 @@ export class AgyBridge {
     })
   }
 
-  async #beginTurn(proc, history, body, callerWorkDir, model, selection, answered) {
+  async #beginTurn(proc, history, body, callerWorkDir, model, selection, answered, prefixResumeLen = null) {
     const reminder = outputFormatReminder(body)
     const flattened = proc.pendingFlattenedTurn
     proc.pendingFlattenedTurn = null
     const isFirstTurn = !proc.hasSentFirstTurn
     const baseParts = !isFirstTurn
-      ? renderContinuedTurnParts(flattened
-        ? [flattened, ...body.messages.slice(1)]
-        : withoutAnswered(body.messages.slice(history.length), answered))
+      ? (prefixResumeLen != null && prefixResumeLen < history.length
+          ? renderHistoryDeltaParts(
+              history.slice(prefixResumeLen),
+              withoutAnswered(body.messages.slice(history.length), answered),
+            )
+          : renderContinuedTurnParts(flattened
+              ? [flattened, ...body.messages.slice(1)]
+              : withoutAnswered(body.messages.slice(history.length), answered)))
       : renderInitialPromptParts(
           body,
           callerWorkDir,
@@ -1595,8 +1700,8 @@ export class AgyBridge {
       model,
       effort: selection?.effort || "",
       instructions: instructionsIdentity(instructions),
-      messages: historyKey(body.messages),
-      tools: tools.map((t) => ({ name: t.name, inputSchema: t.inputSchema })),
+      messages: collapsedHistoryKey(body.messages),
+      tools: toolsSignature(tools),
       format: body.output_config?.format || body.response_format || null,
     }))
   }
@@ -1757,8 +1862,8 @@ export class AgyBridge {
         hasToolResults: resultBlocks.length > 0,
         userId: body.metadata?.user_id || "",
       }
-      const begin = (proc, history, answeredIds = null) =>
-        this.#beginTurn(proc, history, body, callerWorkDir, model, selection, answeredIds)
+      const begin = (proc, history, answeredIds = null, prefixResumeLen = null) =>
+        this.#beginTurn(proc, history, body, callerWorkDir, model, selection, answeredIds, prefixResumeLen)
 
       // Exact completed-turn dedup check (if no active pending MCP call matches).
       const replayKey = this.#replayKey(convKey, model, selection, body, tools, instructions)
@@ -1831,6 +1936,7 @@ export class AgyBridge {
                 incoming_len: trailing.history?.length ?? null,
                 history_invalid: !!proc.historyInvalid,
               })
+            if (historyMatches && !proc.historyInvalid) this.checkpointProc(proc)
             this.#dropFromPool(proc)
             proc.abandonTurn(turn)
             await proc.stop()
@@ -1899,8 +2005,8 @@ export class AgyBridge {
         return this.#cachedResponse(cached, body)
       }
 
-      const { proc, history } = await this.#acquireProc(agy, convKey, acquireOpts, isFresh)
-      const turn = await begin(proc, history)
+      const { proc, history, prefixResumeLen = null } = await this.#acquireProc(agy, convKey, acquireOpts, isFresh)
+      const turn = await begin(proc, history, null, prefixResumeLen)
       return this.#streamResponse(proc, turn, body, signal, replayKey)
     } catch (error) {
       return jsonError(error.statusCode ?? 502, error.message, error.code, { noRetry: error.noRetry })
@@ -2357,7 +2463,7 @@ class Proc {
     this.model = opts.model
     this.selection = opts.selection
     this.tools = opts.tools
-    this.toolsSignature = JSON.stringify(opts.tools)
+    this.toolsSignature = toolsSignature(opts.tools)
     this.workDir = opts.workDir
     this.instructions = opts.instructions || ""
     this.userId = opts.userId || ""
@@ -2607,7 +2713,7 @@ class Proc {
   }
 
   async updateTools(tools) {
-    const signature = JSON.stringify(tools)
+    const signature = toolsSignature(tools)
     if (signature === this.toolsSignature) return
     this.tools = tools
     this.toolsSignature = signature

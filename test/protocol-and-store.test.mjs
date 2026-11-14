@@ -7,8 +7,10 @@ import {
   historyKey,
   inspectToolTurn,
   maxInitialPromptBytes,
+  renderHistoryDeltaParts,
   SCIENCE_SYSTEM_COMPANION_RE,
   stripToolUseInputs,
+  toolsSignature,
   toolUseIdentitiesKey,
 } from "../src/protocol.mjs"
 import { CheckpointStore, CompletedTurnCache } from "../src/session-store.mjs"
@@ -112,6 +114,33 @@ describe("protocol companion notices & budgets", () => {
     ]
     expect(collapsedHistoryKey(rawExpected)).toBe(collapsedHistoryKey(clientCollapsed))
   })
+
+  it("canonicalizes tool signatures regardless of tool order or nested schema key order", () => {
+    const toolsA = [
+      { name: "bash", description: "Run shell", inputSchema: { type: "object", required: ["cmd"], properties: { cmd: { type: "string" } } } },
+      { name: "read_file", description: "Read file", inputSchema: { type: "object", properties: { path: { type: "string" } } } },
+    ]
+    const toolsB = [
+      { name: "read_file", description: "Read file", inputSchema: { properties: { path: { type: "string" } }, type: "object" } },
+      { name: "bash", description: "Run shell", inputSchema: { properties: { cmd: { type: "string" } }, required: ["cmd"], type: "object" } },
+    ]
+    expect(toolsSignature(toolsA)).toBe(toolsSignature(toolsB))
+  })
+
+  it("renders delta history checkpoints cleanly before the current turn", () => {
+    const parts = renderHistoryDeltaParts(
+      [
+        { role: "user", content: "Turn 2 question" },
+        { role: "assistant", content: [{ type: "text", text: "Turn 2 answer" }] },
+      ],
+      [{ role: "user", content: "Turn 3 question" }],
+    )
+    const text = parts.map((p) => p.text).join("")
+    expect(text).toContain("<continued_history_since_checkpoint>")
+    expect(text).toContain("Human: Turn 2 question")
+    expect(text).toContain("Assistant: Turn 2 answer")
+    expect(text).toContain("Turn 3 question")
+  })
 })
 
 describe("CheckpointStore & CompletedTurnCache", () => {
@@ -192,5 +221,50 @@ describe("CheckpointStore & CompletedTurnCache", () => {
     cache.set("k1", { content: [{ type: "text", text: "done" }], stopReason: "end_turn", usage: { input_tokens: 1, output_tokens: 1 } })
     expect(cache.get("k1")?.content?.[0]?.text).toBe("done")
     expect(cache.get("missing")).toBeNull()
+  })
+
+  it("finds verified shorter prefix candidates ordered by role and length", () => {
+    const dir = makeTempDir("prefix-ckpt-")
+    const file = path.join(dir, "checkpoints.json")
+    const store = new CheckpointStore(file)
+    const h2 = [
+      { role: "user", content: "Start" },
+      { role: "assistant", content: [{ type: "text", text: "A1" }] },
+    ]
+    const h4 = [
+      ...h2,
+      { role: "user", content: "Step 2" },
+      { role: "assistant", content: [{ type: "text", text: "A2" }] },
+    ]
+    const convKey = conversationKey({ messages: h2 })
+    const instructionsHash = digest("sys")
+
+    store.upsert({
+      sessionId: "sess_len2",
+      convKey,
+      historyHash: digest(historyKey(h2)),
+      historyLength: h2.length,
+      instructionsHash,
+      workDir: "/tmp/proj",
+      role: "primary",
+    })
+    store.upsert({
+      sessionId: "sess_len4",
+      convKey,
+      historyHash: digest(historyKey(h4)),
+      historyLength: h4.length,
+      instructionsHash,
+      workDir: "/tmp/proj",
+      role: "primary",
+    })
+
+    const candidates = store.findPrefixCandidates({
+      convKey,
+      workDir: "/tmp/proj",
+      instructionsHash,
+      historyLength: 6,
+      excludeSessionIds: new Set(),
+    })
+    expect(candidates.map((c) => c.sessionId)).toEqual(["sess_len4", "sess_len2"])
   })
 })

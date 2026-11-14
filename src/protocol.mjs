@@ -686,6 +686,24 @@ export function normalizeTools(body) {
   return tools
 }
 
+export function toolsSignature(tools) {
+  if (!Array.isArray(tools) || !tools.length) return "[]"
+  const canonical = tools
+    .map((tool) => ({
+      name: String(tool?.name || ""),
+      description: typeof tool?.description === "string" ? tool.description : "",
+      inputSchema: tool?.inputSchema ?? tool?.input_schema ?? { type: "object", properties: {} },
+    }))
+    .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))
+  return stableJSON(canonical)
+}
+
+export function maxRequestBytes() {
+  const configured = Number(process.env.AGY_BOOST_MAX_REQUEST_BYTES || process.env.AGY_BRIDGE_MAX_REQUEST_BYTES)
+  if (Number.isFinite(configured) && configured > 0) return Math.floor(configured)
+  return 32 * 1024 * 1024
+}
+
 export function appendPrompt(out, content) {
   const blocks = typeof content === "string" ? [{ type: "text", text: content }] : content
   for (const block of blocks) {
@@ -1209,6 +1227,18 @@ export function renderInitialPromptParts(body, callerWorkDir, instructionsInSess
 
 export function renderContinuedTurnParts(messages) {
   return renderTurnMessagesParts(messages)
+}
+
+export function renderHistoryDeltaParts(historyDelta, currentMessages) {
+  const out = []
+  if (Array.isArray(historyDelta) && historyDelta.length) {
+    appendPrompt(out, "<continued_history_since_checkpoint>\n")
+    for (const message of historyDelta) appendPrompt(out, renderHistoryEntry(clipHistoryMessage(message)))
+    appendPrompt(out, "</continued_history_since_checkpoint>\n\n")
+  }
+  const current = renderTurnMessagesParts(currentMessages)
+  if (current.length) appendPrompt(out, current)
+  return toPromptParts(out)
 }
 
 export function extractToolResults(body) {

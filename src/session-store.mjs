@@ -203,6 +203,31 @@ export class CheckpointStore {
     return out.map((item) => item.entry)
   }
 
+  findPrefixCandidates(query) {
+    this.load()
+    const now = Date.now()
+    const out = []
+    const maxLen = Number(query.historyLength) || 0
+    if (maxLen <= 1) return out
+    for (const entry of this.entries.values()) {
+      if (!this.#validEntry(entry, now)) continue
+      if (query.excludeSessionIds?.has(entry.sessionId)) continue
+      const keyMatch = entry.convKey === query.convKey ||
+        (query.outerSession && entry.outerSession && entry.outerSession === query.outerSession)
+      if (!keyMatch) continue
+      if ((entry.workDir ?? null) !== (query.workDir ?? null)) continue
+      if (entry.instructionsHash !== query.instructionsHash) continue
+      if (!(entry.historyLength > 0 && entry.historyLength < maxLen)) continue
+      out.push(entry)
+    }
+    out.sort((a, b) => {
+      if (a.role !== b.role) return a.role === "primary" ? -1 : 1
+      if (a.historyLength !== b.historyLength) return b.historyLength - a.historyLength
+      return b.at - a.at
+    })
+    return out
+  }
+
   // Returns true when any active/stored primary checkpoint exists for convKey/outerSession
   // at a different history state (so an incoming diverging non-tool or side-call query
   // should isolate itself in a branch slot rather than stealing/mutating the primary).

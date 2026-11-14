@@ -4,6 +4,7 @@ import http from "node:http"
 import path from "node:path"
 import { pathToFileURL } from "node:url"
 import { AgyBridge, jsonError } from "./bridge.mjs"
+import { maxRequestBytes, NO_RETRY_HEADERS } from "./protocol.mjs"
 import { forgetStoredSignIn } from "./helper/signin.mjs"
 import {
   defaultStateDir,
@@ -161,13 +162,43 @@ export async function startDaemon(opts = {}) {
       }
     }
 
-    if (req.method === "POST" && url.pathname === "/v1/messages/count_tokens") {
+    const readBoundedBody = async () => {
+      const limit = maxRequestBytes()
+      const contentLength = Number(req.headers.get("content-length"))
+      if (Number.isFinite(contentLength) && contentLength > limit) {
+        return {
+          tooLarge: jsonError(
+            413,
+            `agy bridge: request size (${contentLength} bytes) exceeds ${limit} byte limit; compact the conversation and retry`,
+            "request_too_large",
+            { headers: NO_RETRY_HEADERS, noRetry: true },
+          ),
+        }
+      }
       const rawBody = await req.text()
+      const actualBytes = Buffer.byteLength(rawBody, "utf8")
+      if (actualBytes > limit) {
+        return {
+          tooLarge: jsonError(
+            413,
+            `agy bridge: request size (${actualBytes} bytes) exceeds ${limit} byte limit; compact the conversation and retry`,
+            "request_too_large",
+            { headers: NO_RETRY_HEADERS, noRetry: true },
+          ),
+        }
+      }
+      return { rawBody }
+    }
+
+    if (req.method === "POST" && url.pathname === "/v1/messages/count_tokens") {
+      const { rawBody, tooLarge } = await readBoundedBody()
+      if (tooLarge) return tooLarge
       return bridge.handleCountTokens(rawBody)
     }
 
     if (req.method === "POST" && url.pathname === "/v1/messages") {
-      const rawBody = await req.text()
+      const { rawBody, tooLarge } = await readBoundedBody()
+      if (tooLarge) return tooLarge
       const outerSession = req.headers.get("x-agy-hook-session") || ""
       return bridge.handleMessages(rawBody, req.headers, req.signal, outerSession)
     }
