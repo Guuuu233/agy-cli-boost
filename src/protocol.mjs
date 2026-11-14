@@ -1034,8 +1034,8 @@ const DSH_TIME_CONTEXT_RE = /(?:^|\r?\n)Time sampled while preparing turn \d+, s
 const DSH_REPEAT_TOOL_RE = /(?:^|\r?\n)(?:You are repeating the exact same tool call with identical arguments\. Carefully analyze the previous result before calling again: if the task is not complete, try a different approach or different arguments instead of repeating the call\.|Repeated tool call detected:\r?\n- tool: [^\r\n]+\r?\n- consecutive_calls: \d+\r?\n- arguments: [^\r\n]+\r?\nThe repeated calls are not making progress\. Do not call this tool with these exact arguments again\. Inspect the latest result and choose a different action, different arguments, or finish the task if enough evidence has been gathered\.)/g
 const DSH_PLAN_MODE_RE = /(?:^|\r?\n)The user switched this session (?:to plan|back to the default) mode\.(?=\r?\n|$)/g
 const DSH_RUNTIME_SNAPSHOT_RE = /^Current runtime context(?:\. This snapshot supersedes earlier runtime-context snapshots\.(?:\r?\n[\s\S]*)?|: none\. Earlier runtime-context snapshots no longer apply\.)$/
-// Claude Science tool-companion notices (e.g. read_file line pagination)
-export const SCIENCE_SYSTEM_COMPANION_RE = /^\[System\]\s+(?:Showing lines \d+-\d+ of \d+|File |Output |Note:|Warning:|Truncated\b)/
+// Claude Science tool-companion notices (e.g. read_file line pagination and attached vision files)
+export const SCIENCE_SYSTEM_COMPANION_RE = /^\[System\]\s+(?:Showing lines \d+-\d+ of \d+|Attached file:|File |Output |Note:|Warning:|Truncated\b)/
 
 function isMetaOnlyUserText(text) {
   const rest = stripMagpiePlaceholderNotice(text)

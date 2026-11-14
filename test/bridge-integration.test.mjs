@@ -1087,4 +1087,74 @@ describe("AgyBridge integration (mock agy ACP + daemon)", () => {
     health = await healthRes.json()
     expect(health.poolSize).toBeLessThanOrEqual(3)
   })
+
+  it("delivers queued_for_vision read_file image + Attached file notice in-place without dropping tool turn", async () => {
+    const dir = makeTempDir("vision-attach-")
+    const eventsFile = path.join(dir, "mock-agy.jsonl")
+    process.env.MOCK_AGY_EVENTS_FILE = eventsFile
+
+    const daemon = await startDaemon({
+      stateDir: dir,
+      findAgy: () => MOCK_AGY,
+      skipSignInCheck: true,
+      skipInfoFile: true,
+      exitOnShutdown: false,
+    })
+    cleanups.push(() => daemon.shutdown())
+
+    const headers = {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${daemon.authKey}`,
+      "x-agy-hook-session": "ses_vision_1",
+      "x-cwd": "/tmp/demo-repo",
+    }
+    const tools = [{
+      name: "read_file",
+      description: "Read file",
+      input_schema: { type: "object", properties: { path: { type: "string" } } },
+    }]
+
+    const r1 = await fetch(`http://127.0.0.1:${daemon.port}/v1/messages`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: "claude-opus-4-6-thinking",
+        max_tokens: 1024,
+        stream: true,
+        tools,
+        messages: [{ role: "user", content: "Please CALL_TOOL:read_file" }],
+      }),
+    })
+    const m1 = await parseSseToJson(r1)
+    const toolUse = m1.content.find((b) => b.name === "read_file")
+    expect(toolUse).toBeTruthy()
+
+    const r2 = await fetch(`http://127.0.0.1:${daemon.port}/v1/messages`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: "claude-opus-4-6-thinking",
+        max_tokens: 1024,
+        stream: false,
+        tools,
+        messages: [
+          { role: "user", content: "Please CALL_TOOL:read_file" },
+          { role: "assistant", content: m1.content },
+          {
+            role: "user",
+            content: [
+              { type: "tool_result", tool_use_id: toolUse.id, content: "{\"status\":\"queued_for_vision\"}" },
+              { type: "text", text: "[System] Attached file: demo.jpg" },
+              { type: "image", source: { type: "base64", media_type: "image/jpeg", data: "ZmFrZWpwZw==" } },
+            ],
+          },
+        ],
+      }),
+    })
+    expect(r2.status).toBe(200)
+    const m2 = await r2.json()
+    expect(m2.content[0].text).toContain("TOOL_OK:read_file:")
+    const events = readMockEvents(eventsFile)
+    expect(events.filter((e) => e.event === "session/new").length).toBe(1)
+  })
 })

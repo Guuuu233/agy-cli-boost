@@ -136,7 +136,7 @@ export function configModelSelection(options, model, selection) {
 
 export function modelLimits(id) {
   const family = id.replace(/\[1m\]$/i, "").replace(/-(?:minimal|low|medium|high|xhigh|max)$/i, "")
-  if (/^(?:gemini-4-argon|gemini-3\.8-flash)$/i.test(family)) return { context: 1048576, output: 65536 }
+  if (/^(?:gemini-4-(?:argon|hydrogen)|gemini-3\.8-flash)$/i.test(family)) return { context: 1048576, output: 65536 }
   if (/^gemini-4-carbon$/i.test(family)) return { context: 1048576, output: 262144 }
   if (/^claude-(?:opus|sonnet)-5-5$/i.test(family)) return { context: 1000000, output: 64000 }
   if (/^gpt-oss-120b$/i.test(family)) return { context: 131072, output: 32768 }

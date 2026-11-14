@@ -13,6 +13,7 @@ import {
   toolsSignature,
   toolUseIdentitiesKey,
 } from "../src/protocol.mjs"
+import { modelLimits } from "../src/catalog.mjs"
 import { CheckpointStore, CompletedTurnCache } from "../src/session-store.mjs"
 import { digest } from "../src/protocol.mjs"
 
@@ -62,6 +63,37 @@ describe("protocol companion notices & budgets", () => {
     const joined = inspected.results[0].result.content.map((c) => c.text).join("\n")
     expect(joined).toContain("file content...")
     expect(joined).toContain(notice)
+  })
+
+  it("recognizes Claude Science read_file attached image notices as non-steering companions", () => {
+    const notice = "[System] Attached file: t8_top_losses.jpg"
+    expect(SCIENCE_SYSTEM_COMPANION_RE.test(notice)).toBe(true)
+
+    const rawResults = [{
+      block: { type: "tool_result", tool_use_id: "toolu_vis1", content: "{\"status\":\"queued_for_vision\"}" },
+      call: { id: "toolu_vis1", name: "read_file" },
+      result: { content: [{ type: "text", text: "{\"status\":\"queued_for_vision\"}" }], isError: false },
+    }]
+    const body = {
+      messages: [
+        { role: "user", content: "Inspect t8_top_losses.jpg" },
+        { role: "assistant", content: [{ type: "tool_use", id: "toolu_vis1", name: "read_file", input: { path: "t8_top_losses.jpg" } }] },
+        {
+          role: "user",
+          content: [
+            { type: "tool_result", tool_use_id: "toolu_vis1", content: "{\"status\":\"queued_for_vision\"}" },
+            { type: "text", text: notice },
+            { type: "image", source: { type: "base64", media_type: "image/jpeg", data: "ZmFrZWpwZw==" } },
+          ],
+        },
+      ],
+    }
+
+    const inspected = inspectToolTurn(rawResults, body)
+    expect(inspected.userSteered).toBe(false)
+    expect(inspected.results[0].result.content.some((c) => c.type === "image" && c.mimeType === "image/jpeg")).toBe(true)
+    expect(inspected.results[0].result.content.map((c) => c.text || "").join("\n")).toContain(notice)
+    expect(modelLimits("gemini-4-hydrogen-medium")).toEqual({ context: 1048576, output: 65536 })
   })
 
   it("still detects genuine user steering beside tool_result", () => {
