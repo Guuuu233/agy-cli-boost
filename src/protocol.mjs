@@ -1269,6 +1269,42 @@ export function extractToolResults(body) {
     ? message.content.filter(block => block?.type === "tool_result") : [])
 }
 
+// Strip orphaned tool_use blocks from the trailing assistant message when no
+// matching tool_result follows.  Codex (and similar harnesses) can send a
+// request whose last message is an assistant turn containing text *and* a
+// truncated/incomplete tool_use block — e.g. when the upstream model hit the
+// output-token limit mid-tool-call.  Without this cleanup, assistantTextOf()
+// returns null (it requires pure-text content), the prefill path is skipped,
+// and validateBody rejects the entire request.  By stripping the orphaned
+// tool_use blocks here we let the text portion enter the prefill path so the
+// model can retry the interrupted tool call.
+export function stripOrphanedToolUse(body) {
+  if (!Array.isArray(body?.messages) || !body.messages.length) return body
+  const last = body.messages.at(-1)
+  if (!last || last.role !== "assistant" || !Array.isArray(last.content)) return body
+  if (!last.content.some(b => b?.type === "tool_use")) return body
+  // Collect the tool_use ids in this assistant message.
+  const toolUseIds = new Set(last.content.filter(b => b?.type === "tool_use").map(b => b.id))
+  // Check whether any subsequent user message carries a matching tool_result.
+  // (In the failing case the assistant message is literally the last one, so
+  // there are no subsequent messages at all.)
+  const idx = body.messages.lastIndexOf(last)
+  for (let i = idx + 1; i < body.messages.length; i++) {
+    const m = body.messages[i]
+    if (m.role !== "user" || !Array.isArray(m.content)) continue
+    for (const b of m.content) {
+      if (b?.type === "tool_result" && toolUseIds.has(b.tool_use_id)) toolUseIds.delete(b.tool_use_id)
+    }
+  }
+  if (!toolUseIds.size) return body  // all tool_use blocks have results — nothing to strip
+  const kept = last.content.filter(b => !(b?.type === "tool_use" && toolUseIds.has(b.id)))
+  if (!kept.length) {
+    // No content left after stripping — drop the entire assistant message.
+    return { ...body, messages: body.messages.slice(0, -1) }
+  }
+  return { ...body, messages: [...body.messages.slice(0, -1), { ...last, content: kept }] }
+}
+
 export function validateBody(body) {
   if (!Array.isArray(body?.messages) || !body.messages.length) {
     throw new UnsupportedContent("a request without messages")

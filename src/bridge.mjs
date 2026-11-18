@@ -64,6 +64,7 @@ import {
   sessionInstructions,
   stableJSON,
   stripToolUseInputs,
+  stripOrphanedToolUse,
   systemText,
   toolResult,
   toolsSignature,
@@ -1804,7 +1805,7 @@ export class AgyBridge {
 
     let body
     try {
-      body = JSON.parse(rawBody)
+      body = stripOrphanedToolUse(JSON.parse(rawBody))
       validateBody(body)
     } catch (error) {
       return jsonError(error.statusCode ?? 400, error.message)

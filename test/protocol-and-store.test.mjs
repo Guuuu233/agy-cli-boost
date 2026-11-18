@@ -11,6 +11,7 @@ import {
   renderHistoryDeltaParts,
   SCIENCE_SYSTEM_COMPANION_RE,
   stripToolUseInputs,
+  stripOrphanedToolUse,
   toolsSignature,
   toolUseIdentitiesKey,
 } from "../src/protocol.mjs"
@@ -327,5 +328,88 @@ describe("CheckpointStore & CompletedTurnCache", () => {
       excludeSessionIds: new Set(),
     })
     expect(candidates.map((c) => c.sessionId)).toEqual(["sess_len4", "sess_len2"])
+  })
+})
+
+describe("stripOrphanedToolUse", () => {
+  it("strips orphaned tool_use from the last assistant message, keeping text", () => {
+    const body = {
+      messages: [
+        { role: "user", content: "create file" },
+        { role: "assistant", content: [
+          { type: "text", text: "creating scripts/run_r2_p1_matrix.py now" },
+          { type: "tool_use", id: "tu_1", name: "Write", input: { path: "scripts/run_r2_p1_matrix.py" } },
+        ]},
+      ],
+    }
+    const result = stripOrphanedToolUse(body)
+    expect(result.messages).toHaveLength(2)
+    expect(result.messages[1].content).toEqual([
+      { type: "text", text: "creating scripts/run_r2_p1_matrix.py now" },
+    ])
+  })
+
+  it("removes the entire assistant message when only tool_use remains", () => {
+    const body = {
+      messages: [
+        { role: "user", content: "create file" },
+        { role: "assistant", content: [
+          { type: "tool_use", id: "tu_1", name: "Write", input: {} },
+        ]},
+      ],
+    }
+    const result = stripOrphanedToolUse(body)
+    expect(result.messages).toHaveLength(1)
+    expect(result.messages[0].role).toBe("user")
+  })
+
+  it("does not strip tool_use that has a matching tool_result", () => {
+    const body = {
+      messages: [
+        { role: "user", content: "create file" },
+        { role: "assistant", content: [
+          { type: "text", text: "creating now" },
+          { type: "tool_use", id: "tu_1", name: "Write", input: {} },
+        ]},
+        { role: "user", content: [
+          { type: "tool_result", tool_use_id: "tu_1", content: "done" },
+        ]},
+      ],
+    }
+    const result = stripOrphanedToolUse(body)
+    expect(result).toBe(body) // unchanged — same reference
+  })
+
+  it("passes through requests without trailing assistant messages", () => {
+    const body = { messages: [{ role: "user", content: "hello" }] }
+    expect(stripOrphanedToolUse(body)).toBe(body)
+  })
+
+  it("passes through assistant messages with no tool_use", () => {
+    const body = {
+      messages: [
+        { role: "user", content: "hi" },
+        { role: "assistant", content: [{ type: "text", text: "hello" }] },
+      ],
+    }
+    expect(stripOrphanedToolUse(body)).toBe(body)
+  })
+
+  it("keeps non-tool_use non-text blocks (e.g. thinking) alongside text", () => {
+    const body = {
+      messages: [
+        { role: "user", content: "plan" },
+        { role: "assistant", content: [
+          { type: "thinking", thinking: "let me think..." },
+          { type: "text", text: "here is my plan" },
+          { type: "tool_use", id: "tu_x", name: "Bash", input: {} },
+        ]},
+      ],
+    }
+    const result = stripOrphanedToolUse(body)
+    expect(result.messages[1].content).toEqual([
+      { type: "thinking", thinking: "let me think..." },
+      { type: "text", text: "here is my plan" },
+    ])
   })
 })
