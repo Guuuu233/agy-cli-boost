@@ -191,6 +191,22 @@ async function handlePrompt(id, params) {
       return
     }
 
+    // REPLY_TEXT:<text> answers with exactly <text>, a few characters at a
+    // time (agy passes some upstream errors on as the reply's text).
+    const replyText = /REPLY_TEXT:(.+)$/s.exec(promptText)
+    if (replyText) {
+      const text = replyText[1].trim()
+      for (let i = 0; i < text.length; i += 7) {
+        send({
+          jsonrpc: "2.0",
+          method: "session/update",
+          params: { sessionId: sid, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: text.slice(i, i + 7) } } },
+        })
+      }
+      send({ jsonrpc: "2.0", id, result: { stopReason: "end_turn", usage: acpUsage } })
+      return
+    }
+
     const replyPrefix = promptText.includes("SIDE_CALL") ? "SIDE_REPLY" : "MAIN_REPLY"
     if (genMatch && !promptText.includes("SKIP_GEN_USAGE")) {
       writeGenMetadata(sid, {

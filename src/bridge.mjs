@@ -24,6 +24,7 @@ import { buildGeminiShadow } from "./helper/gemini-shadow.mjs"
 import { spawnAgy, windowsMcpShim, windowsNcBuild, windowsTreeKill } from "./helper/platform.mjs"
 import { cannotSignIn, readStoredSignIn, storedSignInNow } from "./helper/signin.mjs"
 import { modelUsageAfter, modelUsageCursor, sessionDbPath } from "./helper/step-usage.mjs"
+import { classifyUpstreamFailure, couldBeUpstreamFailure } from "./helper/upstream-failure.mjs"
 import {
   AgentTurnError,
   BusyError,
@@ -110,6 +111,11 @@ const MAX_PROCS = () => positiveTimeout(process.env.AGY_BOOST_MAX_PROCS || proce
 // let go first past this many (claude-tui-boost keeps 6). A conversation let
 // go resumes from its checkpoint; agy busy with a turn are not counted.
 const MAX_IDLE_PROCS = () => positiveTimeout(process.env.AGY_BOOST_MAX_IDLE_PROCS, 6)
+// How long a streamed response waits for its first event before it sends
+// its headers: an error that comes first is then answered with its HTTP
+// status (429 for a quota), which a client can fail over on, not as an
+// error event inside a 200 stream.
+const ERROR_PEEK_MS = () => positiveTimeout(process.env.AGY_BOOST_ERROR_PEEK_MS, 20_000)
 const DETACHED_EVICT_MS = () => positiveTimeout(process.env.AGY_BOOST_DETACHED_EVICT_MS || process.env.AGY_BRIDGE_DETACHED_EVICT_MS, 15 * 60 * 1000)
 const TURN_TIMEOUT_MS = () => positiveTimeout(process.env.AGY_BOOST_TURN_TIMEOUT_MS || process.env.AGY_BRIDGE_TURN_TIMEOUT_MS, 5 * 60 * 1000)
 const TOOL_RESULT_TIMEOUT_MS = () => positiveTimeout(process.env.AGY_BOOST_TOOL_TIMEOUT_MS || process.env.AGY_BRIDGE_TOOL_TIMEOUT_MS, 30 * 60 * 1000)
@@ -471,6 +477,9 @@ class Turn {
     this.cancelledMcpSockets = new Set()
     this.agentError = false
     this.heldText = ""
+    // the first text of the turn, held while it reads like a quota or
+    // capacity error agy passed on as the reply (null: no longer held)
+    this.upstreamHold = ""
     this.timer = null
     this.cleanupTimer = null
     this.logOffset = 0
@@ -590,6 +599,10 @@ class Turn {
 
   push(event) {
     if (this.finalized) return
+    if (this.upstreamHold !== null && event.type !== "text" && event.type !== "result" && event.type !== "error" &&
+      (this.upstreamHold || event.type === "tool")) {
+      this.releaseUpstreamHold()
+    }
     const waiter = this.waiters.shift()
     if (waiter) waiter.resolve(event)
     else this.events.push(event)
@@ -627,7 +640,7 @@ class Turn {
       const start = text[marker - 1] === "\n" ? marker - 1 : marker
       this.heldText = text.slice(start)
       text = text.slice(0, start)
-      if (text) this.push({ type: "text", text })
+      this.#replyText(text)
       return
     }
     for (let keep = Math.min(text.length, AGENT_ERROR_MARKER.length - 1); keep > 0; keep--) {
@@ -637,7 +650,35 @@ class Turn {
         break
       }
     }
+    this.#replyText(text)
+  }
+
+  // Antigravity's quota and capacity errors can reach the bridge as the
+  // reply's text with stopReason end_turn (helper/upstream-failure.mjs).
+  // Until the end of the prompt shows it is the whole reply, text that still
+  // reads like one is held back.
+  #replyText(text) {
+    if (this.upstreamHold !== null) {
+      const held = this.upstreamHold + text
+      if (couldBeUpstreamFailure(held)) {
+        this.upstreamHold = held
+        return
+      }
+      this.upstreamHold = null
+      text = held
+    }
     if (text) this.push({ type: "text", text })
+  }
+
+  releaseUpstreamHold() {
+    const held = this.upstreamHold
+    this.upstreamHold = null
+    if (held) this.push({ type: "text", text: held })
+  }
+
+  upstreamFailure() {
+    if (!this.upstreamHold || this.calls.length) return null
+    return classifyUpstreamFailure(this.upstreamHold)
   }
 
   endText() {
@@ -651,7 +692,7 @@ class Turn {
     if (!this.heldText || this.agentError) return
     const text = this.heldText
     this.heldText = ""
-    this.push({ type: "text", text })
+    this.#replyText(text)
   }
 
   complete(result) {
@@ -1956,7 +1997,7 @@ export class AgyBridge {
                 .map((item) => item.block.tool_use_id),
             )
             const newTurn = await begin(proc, trailing.history, answeredIds)
-            return this.#streamResponse(proc, newTurn, body, signal, replayKey)
+            return await this.#streamResponse(proc, newTurn, body, signal, replayKey)
           }
 
           if (needSteer || !historyMatches || proc.workDir !== workDir || !sameInstructions(proc.instructions, instructions)) {
@@ -1981,7 +2022,7 @@ export class AgyBridge {
               proc.continueWith(results)
               proc.recordToolResults(turn, body.messages)
             }
-            return this.#streamResponse(proc, turn, body, signal, replayKey)
+            return await this.#streamResponse(proc, turn, body, signal, replayKey)
           }
         }
 
@@ -2014,7 +2055,7 @@ export class AgyBridge {
               begin: (proc, history) => begin(proc, history),
               attempts,
             })
-            if (recovery.kind === "replayed") return this.#streamResponse(recovery.proc, recovery.turn, body, signal, replayKey)
+            if (recovery.kind === "replayed") return await this.#streamResponse(recovery.proc, recovery.turn, body, signal, replayKey)
             if (recovery.kind === "active") return jsonError(409, "agy bridge: no active MCP call matches these tool results")
             if (recovery.kind === "conflict" || recovery.kind === "incomplete") {
               const code = recovery.kind === "conflict" ? "tool_state_conflict" : "tool_history_incomplete"
@@ -2042,7 +2083,7 @@ export class AgyBridge {
 
       const { proc, history, prefixResumeLen = null } = await this.#acquireProc(agy, convKey, acquireOpts, isFresh)
       const turn = await begin(proc, history, null, prefixResumeLen)
-      return this.#streamResponse(proc, turn, body, signal, replayKey)
+      return await this.#streamResponse(proc, turn, body, signal, replayKey)
     } catch (error) {
       return jsonError(error.statusCode ?? 502, error.message, error.code, { noRetry: error.noRetry })
     }
@@ -2239,9 +2280,13 @@ export class AgyBridge {
     }
   }
 
-  #streamResponse(proc, turn, body, signal, replayKey) {
+  async #streamResponse(proc, turn, body, signal, replayKey) {
     turn.attach()
     const step = turn.registerResponse(body)
+    if (body.stream !== false) {
+      const failed = await this.#errorFirst(proc, turn, signal)
+      if (failed) return failed
+    }
     const msgId = "msg_" + randomUUID().replace(/-/g, "").slice(0, 24)
     const stream = this.#makeAnthropicStream(proc, turn, body, msgId, signal, step, replayKey)
     if (body.stream === false) {
@@ -2254,6 +2299,35 @@ export class AgyBridge {
         "Cache-Control": "no-cache",
         "Connection": "keep-alive",
       },
+    })
+  }
+
+  // Waits up to ERROR_PEEK_MS for the turn's first event; an error answers
+  // the request with its HTTP status. Anything else goes back to the turn.
+  async #errorFirst(proc, turn, signal) {
+    let first
+    try {
+      first = await turn.next(ERROR_PEEK_MS(), signal)
+    } catch {
+      return null
+    }
+    if (!first) return null
+    if (first.type !== "error") {
+      turn.events.unshift(first)
+      return null
+    }
+    const error = first.error
+    if (!error?.keepProcess) {
+      this.#dropFromPool(proc)
+      await proc.stop().catch(() => {})
+    }
+    proc.finalizeTurn(turn)
+    turn.detach()
+    const kind = error?.kind || "api_error"
+    const status = Number.isInteger(error?.status) ? error.status : kind === "rate_limit_error" ? 429 : kind === "invalid_request_error" ? 400 : 502
+    return new Response(JSON.stringify({ type: "error", error: { type: kind, message: String(error?.message ?? error) } }), {
+      status,
+      headers: { "Content-Type": "application/json" },
     })
   }
 
@@ -2964,6 +3038,15 @@ class Proc {
           if (detail) throw this.#formatAgentError(detail)
         }
         turn.flushText()
+        const failure = turn.upstreamFailure()
+        if (failure) {
+          // agy keeps the exchange in its session: never resume or reuse it
+          this.historyInvalid = true
+          throw Object.assign(new Error(`agy bridge: ${failure.message}`), {
+            kind: failure.kind, status: failure.status, keepProcess: false,
+          })
+        }
+        turn.releaseUpstreamHold()
         const late = turn.calls.filter((call) => call.deferred && !call.lateDelivered)
         if (!late.length) {
           turn.complete({ ...(result ?? {}), usage })
