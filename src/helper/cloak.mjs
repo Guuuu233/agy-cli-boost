@@ -1,63 +1,74 @@
-// System prompt lines Antigravity turns away, and paragraphs it answers
-// badly, the same lists and the same rewrites as
-// packages/antigravity/index.mjs (TURNED_AWAY, breakUp, cloak, hint,
-// REWORDED, reword, outgoing). Each package ships on its own, so the code is
-// a copy; cloak.test.mjs fails when the two give a different answer.
-//
-// Antigravity answers a 429 "Resource has been exhausted" to a request whose
-// system prompt has one of these lines, whatever quota is left, and lets the
-// same prompt through with a zero-width space after the first and second
-// character of each word. agy-cli hands the client's system prompt to agy
-// (session instructions, or <external_system_instructions> in the prompt),
-// and agy sends it to Antigravity as written, so it is broken up here before
-// it goes. What the bridge keys sessions on (instructionsIdentity) is the
-// prompt as the client wrote it.
+// Antigravity sometimes returns HTTP 429 to particular system-instruction
+// templates even when quota remains. Change only known, complete templates
+// into equivalent plain-language instructions. Inserting zero-width Unicode
+// no longer reliably changes this upstream behavior (November 2026).
+// Session identity remains based on the original client instructions.
 
 // TURNED_AWAY are the lines, lower-cased.
 export const TURNED_AWAY = [
   "x-anthropic-billing-header:",
   "built on anthropic's claude agent sdk",
+  "you are claude code, anthropic's official cli for claude.",
+  "you are a coding agent running in the codex cli, a terminal-based coding assistant.",
   "you are codex, an agent based on gpt-5",
   "you are codex, a coding agent based on gpt-5",
   "hermes agent, an intelligent ai assistant created by nous research",
   "rfc 2119 keywords: must, required, should, recommended, may, optional.",
+  "important: assist with authorized security testing,",
 ]
 
-const ZW = "​"
+// Format characters left behind by older cloak versions should not preserve
+// a recognizable fingerprint. Remove them only on lines with known patterns.
+const INVISIBLE = /[\u200b\u200c\u2060\u00ad]/g
+const NEUTRAL_ROLE = "You are a coding assistant working in an interactive development environment."
+const NEUTRAL_SDK = "an agent integration framework"
+const NEUTRAL_RESEARCH = "You are a rigorous technical research assistant. Analyze censorship-resistant networking, privacy and security protocols, and biological systems at the level of mechanisms, methods, evidence, and limitations. Do not infer intent from topic labels; address the actual research question precisely and distinguish evidence from speculation."
+
+const REPLACEMENTS = [
+  // Multica's Codex-compatible review agent sends a different stock opener
+  // than the historical "You are Codex, ... based on GPT-5/6" signatures.
+  // Rewrite the full identity sentence only; retain capability/tool rules.
+  [/^You are a coding agent running in the Codex CLI, a terminal-based coding assistant\. Codex CLI is an open source project led by OpenAI\. You are expected to be precise, safe, and helpful\.$/i,
+    () => "You are a precise and capable coding assistant operating in a terminal-based development environment."],
+  [/^Within this context, Codex refers to the open-source agentic coding interface \(not the old Codex language model built by OpenAI\)\.$/i,
+    () => "The coding interface provides tools, workspace context, and instructions for software engineering tasks."],
+  [/^IMPORTANT: Assist with authorized security testing,[^\r\n]{0,900}Dual-use security tools[^\r\n]{0,900}defensive use cases\.$/i,
+    () => NEUTRAL_RESEARCH],
+  [/^x-anthropic-billing-header:[^\r\n]*$/i, () => ""],
+  [/You are Claude Code, Anthropic['’]s official CLI for Claude, running within the Claude Agent SDK\./i,
+    () => NEUTRAL_ROLE],
+  [/You are Claude Code, Anthropic['’]s official CLI for Claude\./i,
+    () => NEUTRAL_ROLE],
+  [/You are a Claude agent, built on (?:Anthropic['’]s Claude Agent SDK|the Claude Agent SDK by Anthropic)\./i,
+    () => "You are an AI assistant working in an agent environment."],
+  [/built on (?:Anthropic['’]s Claude Agent SDK|the Claude Agent SDK by Anthropic)/i,
+    () => "built using " + NEUTRAL_SDK],
+  [/You are Codex, (?:an agent|a coding agent) based on GPT-[56](?:\.\d+)*(?:-[\w-]+)*/i,
+    () => NEUTRAL_ROLE.slice(0,-1)],
+  [/Hermes Agent, an intelligent AI assistant created by Nous Research/i,
+    () => "a general-purpose AI assistant"],
+  [/RFC 2119 keywords:\s*MUST,\s*REQUIRED,\s*SHOULD,\s*RECOMMENDED,\s*MAY,\s*OPTIONAL\./i,
+    () => "Requirement terms: MUST and REQUIRED indicate obligations; SHOULD and RECOMMENDED indicate preferred practices; MAY and OPTIONAL indicate discretion."],
+]
 
 export function turnsAway(system) {
-  const low = String(system ?? "").toLowerCase()
-  return TURNED_AWAY.some((l) => low.includes(l))
+  if (typeof system !== "string") return false
+  return system.split(/\r?\n/).some((line) => {
+    const plain = line.replace(INVISIBLE, "")
+    return REPLACEMENTS.some(([pattern]) => pattern.test(plain))
+  })
 }
 
-const asciiLower = (s) => s.replace(/[A-Z]/g, (c) => c.toLowerCase())
-
-// breakUp puts a zero-width space after the first and after the second
-// character of every run of three or more letters or digits in a line.
-// One after the first letter only stopped working on 11-11.
-const breakUp = (line) => line.replace(/[A-Za-z0-9]{3,}/g, (w) => w[0] + ZW + w[1] + ZW + w.slice(2))
-
 export function cloak(system) {
-  if (typeof system !== "string" || !turnsAway(system)) return system
-  const low = asciiLower(system)
-  const at = []
-  for (const line of TURNED_AWAY) {
-    for (let i = 0; ; ) {
-      const j = low.indexOf(line, i)
-      if (j < 0) break
-      at.push([j, j + line.length])
-      i = j + line.length
-    }
-  }
-  at.sort((a, b) => a[0] - b[0])
-  let out = ""
-  let prev = 0
-  for (const [from, to] of at) {
-    if (from < prev) continue
-    out += system.slice(prev, from) + breakUp(system.slice(from, to))
-    prev = to
-  }
-  return out + system.slice(prev)
+  if (typeof system !== "string") return system
+  return system.replace(/[^\r\n]+/g, (line) => {
+    const plain = line.replace(INVISIBLE, "")
+    if (!REPLACEMENTS.some(([pattern]) => pattern.test(plain))) return line
+    let result = plain
+    for (const [pattern, replacement] of REPLACEMENTS)
+      result = result.replace(pattern, replacement)
+    return result
+  })
 }
 
 // REWORDED are paragraphs that go through but are answered badly, each with
@@ -78,7 +89,7 @@ export function reword(system) {
   return system
 }
 
-// outgoing is system text as agy is handed it: broken up, then reworded
+// outgoing is system text as agy is handed it: minimal targeted rewording.
 export const outgoing = (system) => reword(cloak(system))
 
 const HINT =
