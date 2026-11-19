@@ -46,6 +46,8 @@ Ensure `agy` CLI (`>= 1.4.12`, recommended `>= 1.5.8`) is installed and signed i
 | `AGY_BOOST_DETACHED_EVICT_MS` | `900000` (15m) | Minimum detached tool-turn age before LRU eviction under pool pressure |
 | `AGY_BOOST_TOOL_TIMEOUT_MS` | `1800000` (30m) | Timeout waiting for client `tool_result` |
 | `AGY_BOOST_MAX_PROCS` | `24` | Maximum concurrent `agy acp` child processes in daemon pool |
+| `AGY_BOOST_MAX_IDLE_PROCS` | `6` | Idle `agy acp` processes kept for their conversations' next turn; past this, the cheapest to rebuild are retired and later resume from their checkpoint (busy processes are not counted) |
+| `AGY_BOOST_USER_MCP` | unset | `1` lets `agy acp` start the MCP servers in `~/.gemini/config/mcp_config.json`. By default the bridge runs agy with `--gemini-dir` pointing at a private copy of `~/.gemini` (links, plus an empty `mcp_config.json`): the bridge's agent never uses those servers, but agy would start all of them for every session. Not used on Windows |
 | `AGY_BOOST_RESUME_TTL_MS` | `86400000` (24h) | Checkpoint retention window for `session/resume` |
 | `AGY_BOOST_DAEMON_IDLE_MS` | `14400000` (4h) | Daemon auto-exit delay when pool is empty and idle |
 

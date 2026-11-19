@@ -20,6 +20,7 @@ import {
   selectValues,
 } from "./catalog.mjs"
 import { hint, outgoing, turnsAway } from "./helper/cloak.mjs"
+import { buildGeminiShadow } from "./helper/gemini-shadow.mjs"
 import { spawnAgy, windowsMcpShim, windowsNcBuild, windowsTreeKill } from "./helper/platform.mjs"
 import { cannotSignIn, readStoredSignIn, storedSignInNow } from "./helper/signin.mjs"
 import { modelUsageAfter, modelUsageCursor, sessionDbPath } from "./helper/step-usage.mjs"
@@ -105,6 +106,10 @@ const LONG_IDLE_MS = () => positiveTimeout(
     : 60 * 60 * 1000,
 )
 const MAX_PROCS = () => positiveTimeout(process.env.AGY_BOOST_MAX_PROCS || process.env.AGY_BRIDGE_MAX_PROCS, 24)
+// Idle agy kept for their conversations' next turn, the cheapest to rebuild
+// let go first past this many (claude-tui-boost keeps 6). A conversation let
+// go resumes from its checkpoint; agy busy with a turn are not counted.
+const MAX_IDLE_PROCS = () => positiveTimeout(process.env.AGY_BOOST_MAX_IDLE_PROCS, 6)
 const DETACHED_EVICT_MS = () => positiveTimeout(process.env.AGY_BOOST_DETACHED_EVICT_MS || process.env.AGY_BRIDGE_DETACHED_EVICT_MS, 15 * 60 * 1000)
 const TURN_TIMEOUT_MS = () => positiveTimeout(process.env.AGY_BOOST_TURN_TIMEOUT_MS || process.env.AGY_BRIDGE_TURN_TIMEOUT_MS, 5 * 60 * 1000)
 const TOOL_RESULT_TIMEOUT_MS = () => positiveTimeout(process.env.AGY_BOOST_TOOL_TIMEOUT_MS || process.env.AGY_BRIDGE_TOOL_TIMEOUT_MS, 30 * 60 * 1000)
@@ -796,6 +801,7 @@ export class AgyBridge {
     this.controlServerPromise = null
     this.shimDir = null
     this.shimDirOwned = false
+    this.geminiDir = undefined
     this.shimDirPromise = null
     this.daemonEpoch = randomBytes(4).toString("hex")
     this.eventsFile = path.join(this.stateDir, "bridge-events.jsonl")
@@ -994,6 +1000,25 @@ export class AgyBridge {
     socket.on("error", () => {})
   }
 
+  // The gemini dir agy runs with, without the user's MCP servers
+  // (helper/gemini-shadow.mjs); null keeps agy's own. Built once per daemon.
+  ensureGeminiDir() {
+    if (this.geminiDir !== undefined) return this.geminiDir
+    try {
+      this.geminiDir = buildGeminiShadow(this.stateDir)
+    } catch (error) {
+      this.geminiDir = null
+      this.#appendEventLog("[agy-boost]", {
+        event: "agy_boost_gemini_dir",
+        daemon_epoch: this.daemonEpoch,
+        ts: Date.now(),
+        action: "shadow_failed",
+        reason: String(error?.message ?? error).slice(0, 300),
+      })
+    }
+    return this.geminiDir
+  }
+
   async ensureShimDir() {
     if (this.shimDir && !this.shimDirOwned) {
       try {
@@ -1179,6 +1204,13 @@ export class AgyBridge {
       }
     }
     for (const proc of victims) await this.#retireProc(proc)
+    const idle = [...this.pool.values()].filter((proc) => !proc.turn && !proc.retiring && !proc.dead)
+      .sort((a, b) => this.#procEvictRank(a) - this.#procEvictRank(b) || a.lastUsed - b.lastUsed)
+    for (const proc of idle.slice(0, Math.max(0, idle.length - MAX_IDLE_PROCS()))) {
+      if (proc.turn || proc.retiring) continue
+      this.logSessionEvent(proc, "evicted", "idle_cap", { max_idle: MAX_IDLE_PROCS() })
+      await this.#retireProc(proc)
+    }
     for (const { proc, turn, reason } of stale) {
       if (proc.turn !== turn || proc.retiring) continue
       this.logBridgeEvent(proc, turn, "reclaim", reason, {}, { trigger: "evict_idle" })
@@ -2531,6 +2563,8 @@ class Proc {
       "--ide-mcp-port", String(controlPort),
     ]
     if (this.workDir) args.push("--add-dir", this.workDir)
+    const geminiDir = this.bridge.ensureGeminiDir()
+    if (geminiDir) args.push("--gemini-dir", geminiDir)
     try {
       const childEnv = { ...process.env }
       const inheritedPath = process.env.PATH || childEnv.Path || ""

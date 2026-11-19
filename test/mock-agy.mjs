@@ -76,6 +76,7 @@ if (args[0] !== "acp") {
   console.error("unsupported mock command:", args)
   process.exit(1)
 }
+record({ event: "acp_start", args })
 
 const port = Number(process.env.AGY_BRIDGE_CONTROL_PORT || 0)
 const token = process.env.AGY_BRIDGE_TOKEN || ""
