@@ -85,6 +85,16 @@ describe("a quota error agy passes on as the reply", () => {
     expect(streamedText(await res.text())).toBe(reply)
   })
 
+  it("answers a model agy no longer knows with 503 so the client fails over", async () => {
+    const d = await daemon()
+    const res = await fetch(`http://127.0.0.1:${d.port}/v1/messages`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${d.authKey}`, "x-agy-hook-session": "ses_retired" },
+      body: JSON.stringify({ model: "gemini-retired-model", max_tokens: 64, stream: false, messages: [{ role: "user", content: "hi" }] }),
+    })
+    expect(res.status).toBe(503)
+  })
+
   it("streams a normal reply unchanged", async () => {
     const d = await daemon()
     const res = await ask(d, "ses_normal", "hello there")

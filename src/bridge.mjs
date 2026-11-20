@@ -2784,7 +2784,9 @@ class Proc {
       }
     } catch (error) {
       const wrapped = new Error(`agy bridge: model ${model} is unavailable to this agy account: ${error.message}`)
-      wrapped.statusCode = 400
+      // A model agy no longer knows is a server-side outage for this route, not a bad request:
+      // 503 lets clients fail over to another provider.
+      wrapped.statusCode = /Unknown model ID|model not found|model unavailable/i.test(String(error?.message || "")) ? 503 : 400
       throw wrapped
     }
     this.currentModel = model

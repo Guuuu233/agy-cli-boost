@@ -345,6 +345,10 @@ process.stdin.on("data", (chunk) => {
     }
 
     if (msg.method === "session/set_model") {
+      if (/retired/.test(msg.params?.modelId || "")) {
+        send({ jsonrpc: "2.0", id: msg.id, error: { code: -32602, message: `Unknown model ID: ${msg.params.modelId}` } })
+        continue
+      }
       currentModel = msg.params?.modelId || currentModel
       send({ jsonrpc: "2.0", id: msg.id, result: {} })
       continue
