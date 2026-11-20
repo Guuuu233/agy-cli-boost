@@ -22,6 +22,7 @@ function positiveMs(value, fallback) {
 }
 
 const DAEMON_IDLE_EXIT_MS = () => positiveMs(process.env.AGY_BOOST_DAEMON_IDLE_MS, 4 * 60 * 60 * 1000)
+const SUPERSEDED_CHECK_MS = () => positiveMs(process.env.AGY_BOOST_SUPERSEDED_CHECK_MS, 60_000)
 
 export function computeCodeFingerprint(rootDir = path.resolve(import.meta.dir || path.dirname(new URL(import.meta.url).pathname), "..")) {
   if (process.env.AGY_BOOST_CODE_FINGERPRINT) return process.env.AGY_BOOST_CODE_FINGERPRINT
@@ -312,10 +313,26 @@ export async function startDaemon(opts = {}) {
 
   const idleSweep = setInterval(() => {
     if (shuttingDown) return
+    if (bridge.activeTurnCount() === 0 && supersededBy() !== null) {
+      // Another daemon took over this state dir: finish here instead of
+      // keeping a second pool of agy processes alive.
+      shutdown(opts.exitOnShutdown !== false).catch(() => {})
+      return
+    }
     if (bridge.pool.size === 0 && bridge.activeTurnCount() === 0 && Date.now() - lastRequestAt > DAEMON_IDLE_EXIT_MS()) {
       shutdown(opts.exitOnShutdown !== false).catch(() => {})
     }
-  }, 60_000)
+  }, SUPERSEDED_CHECK_MS())
+
+  function supersededBy() {
+    if (opts.skipInfoFile) return null
+    try {
+      const raw = JSON.parse(fs.readFileSync(infoFile, "utf8"))
+      return Number.isSafeInteger(raw?.pid) && raw.pid > 0 && raw.pid !== process.pid ? raw.pid : null
+    } catch {
+      return null
+    }
+  }
   idleSweep.unref?.()
 
   return {

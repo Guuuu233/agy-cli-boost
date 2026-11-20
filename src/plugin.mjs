@@ -21,9 +21,38 @@ export const NPM_ANTHROPIC = "@ai-sdk/anthropic"
 const DAEMON_ENTRY = fileURLToPath(new URL("./daemon.mjs", import.meta.url))
 const DAEMON_BOOT_TIMEOUT_MS = 10_000
 const DAEMON_PROBE_TIMEOUT_MS = 1_500
+const UNRESPONSIVE_PROBES = 3
+const UNRESPONSIVE_PROBE_MS = 2_500
+const DAEMON_STOP_GRACE_MS = 2_500
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+function signalDaemon(pid, signal) {
+  // The daemon is started detached, so it leads its own process group and its
+  // agy children are in it: signal the group so they go with it.
+  if (process.platform !== "win32") {
+    try { process.kill(-pid, signal); return } catch {}
+  }
+  try { process.kill(pid, signal) } catch {}
+}
+
+async function waitForExit(pid, ms) {
+  const deadline = Date.now() + ms
+  while (Date.now() < deadline && isProcessAlive(pid)) await sleep(40)
+  return !isProcessAlive(pid)
+}
+
+// Stop a daemon that must not keep running: first the way it was asked to
+// (if it was), then SIGTERM, then SIGKILL.
+async function stopDaemonProcess(pid) {
+  if (!pid || pid === process.pid || !isProcessAlive(pid)) return
+  if (await waitForExit(pid, DAEMON_STOP_GRACE_MS)) return
+  signalDaemon(pid, "SIGTERM")
+  if (await waitForExit(pid, DAEMON_STOP_GRACE_MS)) return
+  signalDaemon(pid, "SIGKILL")
+  await waitForExit(pid, 1_000)
 }
 
 function readJsonSafe(filePath) {
@@ -184,20 +213,25 @@ export function createDaemonClient(opts = {}) {
         const key = ensureDaemonKey(stateDir)
         const existing = readJsonSafe(infoFile)
         if (existing?.port && isProcessAlive(existing.pid)) {
-          const health = await probeDaemonHealth(existing.port, key)
+          // A busy machine can make a healthy daemon slow to answer; ask a few
+          // times before deciding it is gone, because starting a second daemon
+          // next to a slow one only makes the machine slower.
+          let health = null
+          for (let attempt = 0; attempt < UNRESPONSIVE_PROBES && isProcessAlive(existing.pid); attempt++) {
+            health = await probeDaemonHealth(existing.port, key, UNRESPONSIVE_PROBE_MS)
+            if (health) break
+          }
           if (health?.ok && health.protocolVersion === PROTOCOL_VERSION) {
             if (health.codeFingerprint === localFingerprint || health.activeTurns > 0) {
               cached = { port: existing.port, authKey: key, pid: existing.pid }
               return cached
             }
             // Idle outdated daemon -> ask it to shut down cleanly before spawning new one.
-            if (await requestDaemonShutdown(existing.port, key)) {
-              const stopDeadline = Date.now() + 2_500
-              while (Date.now() < stopDeadline && isProcessAlive(existing.pid)) {
-                await sleep(40)
-              }
-            }
+            await requestDaemonShutdown(existing.port, key)
           }
+          // Outdated, or alive but not answering: never leave it running next to
+          // the one we are about to start.
+          await stopDaemonProcess(existing.pid)
         }
 
         const prevPid = existing?.pid || 0

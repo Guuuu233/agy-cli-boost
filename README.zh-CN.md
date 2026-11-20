@@ -49,6 +49,7 @@
 | `AGY_BOOST_MAX_IDLE_PROCS` | `6` | 为下一轮保留的空闲 `agy acp` 进程数；超出后先结束重建成本最低的，之后从检查点恢复（正在回答的进程不计） |
 | `AGY_BOOST_USER_MCP` | 不设置 | 设为 `1` 时 `agy acp` 照常启动 `~/.gemini/config/mcp_config.json` 里的 MCP。默认情况下，桥接用 `--gemini-dir` 指向 `~/.gemini` 的私有副本（全部链接回原目录，只有 `mcp_config.json` 为空）运行 agy：桥接的 agent 从不使用这些 MCP，但 agy 会为每个会话全部启动一遍。Windows 不启用 |
 | `AGY_BOOST_ERROR_PEEK_MS` | `20000`（20 秒） | 流式回复发出响应头前等待第一个事件的最长时间。若第一个事件是错误（包括 agy 当作回答文字转来的额度提示），直接以对应 HTTP 状态（如 429）返回，客户端可据此切换线路 |
+| `AGY_BOOST_SUPERSEDED_CHECK_MS` | `60000`（1 分钟） | 后台多久检查一次状态目录是否已被另一个后台接管；被替换且空闲的后台会自行退出 |
 | `AGY_BOOST_RESUME_TTL_MS` | `86400000`（24 小时） | `session/resume` 检查点有效期 |
 | `AGY_BOOST_DAEMON_IDLE_MS` | `14400000`（4 小时） | 进程池全空且无请求后守护进程自动退出的空闲时长 |
 
