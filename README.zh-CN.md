@@ -15,7 +15,7 @@
 
 - **独立常驻守护进程（`src/daemon.mjs`）**：脱离 Magpie 插件宿主独立运行，监听 `127.0.0.1` 并通过 `~/.local/state/magpie-agy-cli-boost/daemon.key`（`0600`）进行 Bearer 鉴权。宿主因 512 MiB 内存重启或重载插件时，`agy acp` 子进程、等待中的 MCP 调用和 Prompt 缓存均保持存活。
 - **轻量插件适配器（`src/plugin.mjs`）**：极低内存占用，完整兼容 OpenCode 1.x / Magpie（`opencode.mjs`）与 OpenCode 2.x（`opencode2.mjs`），通过 `chat.headers` 注入 `x-agy-hook-session`，并在无活跃回合时平滑热替换旧版 daemon。
-- **非破坏性多分支检查点（`src/session-store.mjs`）**：`CheckpointStore`（`checkpoints.json` v2）按 `sessionId` 持久化存储，读取和开轮均不删除；区分 `primary` 与 `branch` 角色，旁路提取请求自动隔离到 `branch` 槽位，绝不覆盖或驱逐主会话。
+- **非破坏性多分支检查点（`src/session-store.mjs`）**：`CheckpointStore`（`checkpoints.json` v2）按 `sessionId` 持久化存储，读取和开轮均不删除；区分 `primary` 与 `branch` 角色，旁路提取请求自动隔离到 `branch` 槽位，绝不覆盖或驱逐主会话。检查点同时记下会话的工作文件夹，续接时在同一文件夹重开：agy 会把文件夹路径写进提示词，换了文件夹，续接后第一轮就命中不了模型的提示词缓存。
 - **协议与调度修复（`src/protocol.mjs`、`src/bridge.mjs`）**：
   - 将 `[System] Showing lines ...` 等分页/状态提示识别为非打断型 companion notice。
   - 允许在包含历史 `tool_result` 的对话中通过 `session/resume` 恢复完整上下文。

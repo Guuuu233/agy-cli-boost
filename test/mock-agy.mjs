@@ -305,7 +305,7 @@ process.stdin.on("data", (chunk) => {
     if (msg.method === "session/new") {
       sessionCounter++
       currentSessionId = `mock-sess-${process.pid}-${sessionCounter}`
-      record({ event: "session/new", sessionId: currentSessionId })
+      record({ event: "session/new", sessionId: currentSessionId, cwd: msg.params?.cwd })
       startWatch()
       controlCall("list").catch(() => {})
       send({
@@ -326,7 +326,7 @@ process.stdin.on("data", (chunk) => {
     if (msg.method === "session/resume") {
       const sid = msg.params?.sessionId
       currentSessionId = sid
-      record({ event: "session/resume", sessionId: sid })
+      record({ event: "session/resume", sessionId: sid, cwd: msg.params?.cwd })
       startWatch()
       controlCall("list").catch(() => {})
       send({

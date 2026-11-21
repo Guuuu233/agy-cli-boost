@@ -135,6 +135,7 @@ export class CheckpointStore {
       historyLength: Number.isFinite(record.historyLength) ? record.historyLength : 0,
       instructionsHash: record.instructionsHash,
       workDir: record.workDir ?? null,
+      workspace: typeof record.workspace === "string" && record.workspace ? record.workspace : null,
       model: record.model || prev?.model || "",
       role: record.role === "branch" ? "branch" : "primary",
       createdAt: prev?.createdAt || now,

@@ -273,6 +273,17 @@ export function ideToolOf(toolCall) {
   return ""
 }
 
+const WORKSPACE_PREFIX = "magpie-agy-boost-"
+
+// A workspace path read back from the checkpoint store, accepted only if it is
+// one of ours directly under the temp folder (it is deleted when the Proc stops).
+function reusableWorkspace(dir) {
+  if (typeof dir !== "string" || !path.isAbsolute(dir)) return null
+  const resolved = path.resolve(dir)
+  if (path.dirname(resolved) !== path.resolve(os.tmpdir())) return null
+  return /^magpie-agy-boost-[A-Za-z0-9_-]{4,32}$/.test(path.basename(resolved)) ? resolved : null
+}
+
 function agentDefinition() {
   const lines = [
     "---",
@@ -964,9 +975,20 @@ export class AgyBridge {
       historyLength: proc.expectedMessages.length,
       instructionsHash: digest(instructionsIdentity(proc.instructions)),
       workDir: proc.workDir ?? null,
+      workspace: proc.workspace || null,
       model: proc.currentModel || proc.model || "",
       role: proc.role || "primary",
     })
+  }
+
+  // Wait until no other Proc holds `dir` (finishing the cleanup of dead ones).
+  // False when a live Proc still uses it.
+  async releaseWorkspace(dir, self) {
+    const holders = [...this.allProcs].filter((p) => p !== self && p.workspace === dir)
+    if (holders.some((p) => !p.dead && !p.stopPromise)) return false
+    await Promise.all(holders.map((p) =>
+      Promise.race([p.stop().catch(() => {}), new Promise((resolve) => setTimeout(resolve, 5_000))])))
+    return ![...this.allProcs].some((p) => p !== self && p.workspace === dir)
   }
 
   #dropFromPool(proc) {
@@ -1574,11 +1596,13 @@ export class AgyBridge {
     const attempts = [
       ...resumeCandidates.map((candidate) => ({
         sessionId: candidate.sessionId,
+        workspace: candidate.workspace ?? null,
         expectedMessages: opts.history,
         prefixLength: null,
       })),
       ...prefixCandidates.map((item) => ({
         sessionId: item.candidate.sessionId,
+        workspace: item.candidate.workspace ?? null,
         expectedMessages: item.expectedMessages,
         prefixLength: item.prefixLength,
       })),
@@ -1591,7 +1615,7 @@ export class AgyBridge {
       const attemptProc = new Proc(this, agyPath, convKey, {
         ...opts,
         role,
-        resume: { sessionId: attempt.sessionId, expectedMessages: attempt.expectedMessages },
+        resume: { sessionId: attempt.sessionId, workspace: attempt.workspace, expectedMessages: attempt.expectedMessages },
       })
       try {
         await attemptProc.start()
@@ -2624,7 +2648,15 @@ class Proc {
     const controlPort = await this.bridge.ensureControlServer()
     const bin = await this.bridge.ensureShimDir()
     this.bridge.sessions.set(this.token, this)
-    this.workspace = await fs.promises.mkdtemp(path.join(os.tmpdir(), "magpie-agy-boost-"))
+    // agy writes its folder path into the prompt: a resumed session hits the model's
+    // prompt cache only when it opens in the folder it was started in.
+    const previous = reusableWorkspace(this.resumeFrom?.workspace)
+    if (previous && await this.bridge.releaseWorkspace(previous, this)) {
+      await fs.promises.mkdir(previous, { recursive: true, mode: 0o700 })
+      this.workspace = previous
+    } else {
+      this.workspace = await fs.promises.mkdtemp(path.join(os.tmpdir(), WORKSPACE_PREFIX))
+    }
     const agentDir = path.join(this.workspace, ".agents", "agents", AGENT_NAME)
     await fs.promises.mkdir(agentDir, { recursive: true })
     await fs.promises.writeFile(path.join(agentDir, "agent.md"), agentDefinition(), { mode: 0o600 })
@@ -3390,7 +3422,8 @@ class Proc {
       }
     }
     this.child = null
-    if (this.workspace) {
+    const sharedWorkspace = [...this.bridge.allProcs].some((p) => p !== this && p.workspace === this.workspace)
+    if (this.workspace && !sharedWorkspace) {
       for (let attempt = 0; attempt < 4; attempt++) {
         try {
           await fs.promises.rm(this.workspace, { recursive: true, force: true })

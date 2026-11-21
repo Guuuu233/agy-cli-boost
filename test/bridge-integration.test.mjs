@@ -312,6 +312,10 @@ describe("AgyBridge integration (mock agy ACP + daemon)", () => {
     const eventsAfter = readMockEvents(eventsFile)
     expect(eventsAfter.some((e) => e.event === "session/resume" && e.sessionId === firstSessionId)).toBe(true)
     expect(eventsAfter.filter((e) => e.event === "session/new").length).toBe(1)
+    // agy writes its folder into the prompt: resuming in the original folder keeps the prompt cache.
+    const newCwd = eventsAfter.find((e) => e.event === "session/new")?.cwd
+    expect(newCwd).toBeTruthy()
+    expect(eventsAfter.find((e) => e.event === "session/resume" && e.sessionId === firstSessionId)?.cwd).toBe(newCwd)
 
     // Completed-turn replay dedup: resending the exact same request hits CompletedTurnCache without touching agy!
     const promptCountBefore = eventsAfter.filter((e) => e.event === "session/prompt").length

@@ -15,7 +15,7 @@ Long agentic sessions using the stock `@magpie-community/opencode-agy-cli-auth` 
 
 - **Detached persistent HTTP daemon (`src/daemon.mjs`)**: Runs outside Magpie's plugin host (`127.0.0.1`, `0600` bearer token in `~/.local/state/magpie-agy-cli-boost/daemon.key`) so `agy acp` processes, in-memory tool calls, and prompt caches survive Magpie 512 MiB host restarts and idle plugin reloads.
 - **Thin plugin adapter (`src/plugin.mjs`)**: Low-RSS shim implementing OpenCode 1.x/Magpie (`opencode.mjs`) and OpenCode 2.x (`opencode2.mjs`) hooks, including `chat.headers` (`x-agy-hook-session`) and idle-safe daemon auto-upgrade.
-- **Non-destructive multi-branch `CheckpointStore` (`src/session-store.mjs`)**: Persists checkpoints keyed by `sessionId` (`checkpoints.json` v2) without deleting on read or turn start, separating `primary` and `branch` roles so side-calls never overwrite or evict the primary session.
+- **Non-destructive multi-branch `CheckpointStore` (`src/session-store.mjs`)**: Persists checkpoints keyed by `sessionId` (`checkpoints.json` v2) without deleting on read or turn start, separating `primary` and `branch` roles so side-calls never overwrite or evict the primary session. Each checkpoint also records the session's working folder, and a resumed session reopens in that same folder: agy writes the folder path into the prompt, so a new folder would make the model's prompt cache miss on the first resumed turn.
 - **Protocol & tool fixes (`src/protocol.mjs`, `src/bridge.mjs`)**:
   - Recognizes `[System] Showing lines ...` and related companion notices without triggering `userSteered`.
   - Allows `session/resume` even when history contains completed `tool_result` turns.
