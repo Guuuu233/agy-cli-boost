@@ -4,6 +4,7 @@ import path from "node:path"
 import {
   collapsedHistoryKey,
   conversationKey,
+  elideImagesLike,
   historyKey,
   historyShapeDiff,
   inspectToolTurn,
@@ -328,6 +329,40 @@ describe("CheckpointStore & CompletedTurnCache", () => {
       excludeSessionIds: new Set(),
     })
     expect(candidates.map((c) => c.sessionId)).toEqual(["sess_len4", "sess_len2"])
+  })
+})
+
+describe("elideImagesLike", () => {
+  const img = { type: "image", source: { type: "base64", media_type: "image/png", data: "AAAA" } }
+  const note = { type: "text", text: "[image omitted]" }
+  const history = (block) => [
+    { role: "user", content: "read it" },
+    { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "Read", input: { p: 1 } }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: [{ type: "text", text: "p1" }, block] }] },
+  ]
+
+  it("swaps an image the client replaced with text, so the histories match", () => {
+    const expected = history(img)
+    const incoming = history(note)
+    expect(historyKey(expected)).not.toBe(historyKey(incoming))
+    const elided = elideImagesLike(expected, incoming)
+    expect(historyKey(elided)).toBe(historyKey(incoming))
+    expect(expected[2].content[0].content[1]).toBe(img) // input left as it was
+  })
+
+  it("returns the same history when nothing was replaced", () => {
+    const expected = history(img)
+    expect(elideImagesLike(expected, history(img))).toBe(expected)
+  })
+
+  it("leaves other differences in place", () => {
+    const expected = history(img)
+    const incoming = history(note)
+    incoming[0] = { role: "user", content: "read something else" }
+    expect(historyKey(elideImagesLike(expected, incoming))).not.toBe(historyKey(incoming))
+    const fewer = history(img)
+    fewer[2].content[0].content = [{ type: "text", text: "p1" }]
+    expect(elideImagesLike(expected, fewer)).toBe(expected)
   })
 })
 

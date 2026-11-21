@@ -19,6 +19,7 @@
 - **协议与调度修复（`src/protocol.mjs`、`src/bridge.mjs`）**：
   - 将 `[System] Showing lines ...` 等分页/状态提示识别为非打断型 companion notice。
   - 允许在包含历史 `tool_result` 的对话中通过 `session/resume` 恢复完整上下文。
+  - 客户端后来把较早的图片换成文字说明时（Claude Code 和 Magpie 为避免超出请求大小限制会这样做），继续沿用正在用的会话：agy 已经有这些图片，仍是同一段对话，提示词缓存照样能命中。
   - 工具列表在回合中增长（`toolsGrew`）时通过 `steerInSession` + `updateTools` 会话内热更新。
   - 通过 `CompletedTurnCache` 对已完成回合的 HTTP 重试直接去重返回。
   - `agy >= 1.5.8` 初始提示词预算提升至 `136 KiB`，并放宽空闲与脱离连接的回收窗口（`IDLE_MS=30m`、`DETACHED_EVICT_MS=15m`、`TOOL_RESULT_TIMEOUT_MS=30m`）。

@@ -428,6 +428,47 @@ export function collapsedHistoryKey(messages) {
   return historyKey(collapseServerToolHistory(messages))
 }
 
+// Clients drop older images from a long conversation to stay under request
+// limits, putting a short text in each one's place (Claude Code, Magpie). agy
+// already holds those images, so it is still the same conversation. Returns
+// `expected` with each image that `incoming` replaced by text, at the same
+// message and block position, swapped for that text; `expected` itself when
+// nothing was replaced.
+export function elideImagesLike(expected, incoming) {
+  if (!Array.isArray(expected) || !Array.isArray(incoming)) return expected
+  let changed = false
+  const out = expected.map((message, i) => {
+    const other = incoming[i]
+    if (!message || !other || other.role !== message.role) return message
+    const content = elideImageBlocks(message.content, other.content)
+    if (content === message.content) return message
+    changed = true
+    return { ...message, content }
+  })
+  return changed ? out : expected
+}
+
+function elideImageBlocks(expected, incoming) {
+  if (!Array.isArray(expected) || !Array.isArray(incoming) || expected.length !== incoming.length) return expected
+  let changed = false
+  const out = expected.map((block, i) => {
+    const other = incoming[i]
+    if (block?.type === "image" && other?.type === "text") {
+      changed = true
+      return other
+    }
+    if (block?.type === "tool_result" && other?.type === "tool_result") {
+      const content = elideImageBlocks(block.content, other.content)
+      if (content !== block.content) {
+        changed = true
+        return { ...block, content }
+      }
+    }
+    return block
+  })
+  return changed ? out : expected
+}
+
 function blockShape(block) {
   if (typeof block === "string") return `text(${block.length})`
   if (!block || typeof block !== "object") return String(block)

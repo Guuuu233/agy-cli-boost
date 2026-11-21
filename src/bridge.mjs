@@ -34,6 +34,7 @@ import {
   ConflictError,
   conversationKey,
   digest,
+  elideImagesLike,
   estimateInputTokens,
   historyShapeDiff,
   estimatePromptPartsTokens,
@@ -2954,26 +2955,26 @@ class Proc {
   matchesHistory(messages) {
     if (this.historyInvalid) return false
     if (this.expectedMessages == null) return !this.turn && !this.hasSentFirstTurn
-    if (historyKey(this.expectedMessages) === historyKey(messages)) return true
-    if (sameToolUseIdentities(this.expectedMessages, messages) &&
-      historyKey(stripToolUseInputs(this.expectedMessages)) === historyKey(stripToolUseInputs(messages))) return true
-    if (collapsedHistoryKey(this.expectedMessages) === collapsedHistoryKey(messages)) return true
-    return collapsedHistoryKey(stripToolUseInputs(this.expectedMessages)) === collapsedHistoryKey(stripToolUseInputs(messages))
+    if (sameHistory(this.expectedMessages, messages)) return true
+    // The client may have swapped older images for text since: still this conversation.
+    const elided = elideImagesLike(this.expectedMessages, messages)
+    return elided !== this.expectedMessages && sameHistory(elided, messages)
   }
 
   matchesPendingTurnHistory(turn, history) {
     if (this.matchesHistory(history)) return true
     if (this.historyInvalid || !turn || this.turn !== turn || !Array.isArray(this.expectedMessages)) return false
+    const expected = elideImagesLike(this.expectedMessages, history)
     let split = history.length
     while (split > 0 && history[split - 1].role === "assistant") split--
-    let expectedSplit = this.expectedMessages.length
-    while (expectedSplit > 0 && this.expectedMessages[expectedSplit - 1].role === "assistant") expectedSplit--
+    let expectedSplit = expected.length
+    while (expectedSplit > 0 && expected[expectedSplit - 1].role === "assistant") expectedSplit--
     const prefixMatches =
-      historyKey(this.expectedMessages.slice(0, expectedSplit)) === historyKey(history.slice(0, split)) ||
-      collapsedHistoryKey(this.expectedMessages.slice(0, expectedSplit)) === collapsedHistoryKey(history.slice(0, split))
+      historyKey(expected.slice(0, expectedSplit)) === historyKey(history.slice(0, split)) ||
+      collapsedHistoryKey(expected.slice(0, expectedSplit)) === collapsedHistoryKey(history.slice(0, split))
     if (!prefixMatches) return false
     const actualAssistant = history.slice(split)
-    const expectedAssistant = this.expectedMessages.slice(expectedSplit)
+    const expectedAssistant = expected.slice(expectedSplit)
     const actualCalls = lastAssistantCalls(actualAssistant)
     const expectedCalls = lastAssistantCalls(expectedAssistant)
     if (!actualCalls.length || actualCalls.length !== expectedCalls.length) return false
@@ -3436,6 +3437,13 @@ class Proc {
     }
     this.bridge.allProcs.delete(this)
   }
+}
+
+function sameHistory(a, b) {
+  if (historyKey(a) === historyKey(b)) return true
+  if (sameToolUseIdentities(a, b) && historyKey(stripToolUseInputs(a)) === historyKey(stripToolUseInputs(b))) return true
+  if (collapsedHistoryKey(a) === collapsedHistoryKey(b)) return true
+  return collapsedHistoryKey(stripToolUseInputs(a)) === collapsedHistoryKey(stripToolUseInputs(b))
 }
 
 function withoutAnswered(messages, answered) {

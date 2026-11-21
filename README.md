@@ -19,6 +19,7 @@ Long agentic sessions using the stock `@magpie-community/opencode-agy-cli-auth` 
 - **Protocol & tool fixes (`src/protocol.mjs`, `src/bridge.mjs`)**:
   - Recognizes `[System] Showing lines ...` and related companion notices without triggering `userSteered`.
   - Allows `session/resume` even when history contains completed `tool_result` turns.
+  - Keeps the live session when the client later replaces an older image with a text note (Claude Code and Magpie do this to stay under request limits): agy already holds the image, so it is still the same conversation and its prompt cache.
   - Updates dynamically added tools (`toolsGrew`) in-session via `steerInSession` + `updateTools`.
   - Deduplicates identical completed-turn HTTP retries via `CompletedTurnCache`.
   - Expands initial prompt budget to `136 KiB` on `agy >= 1.5.8` and extends idle/detached eviction windows (`IDLE_MS=30m`, `DETACHED_EVICT_MS=15m`, `TOOL_RESULT_TIMEOUT_MS=30m`).

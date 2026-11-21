@@ -349,6 +349,68 @@ describe("AgyBridge integration (mock agy ACP + daemon)", () => {
     expect(eventsAfterReplay.filter((e) => e.event === "session/prompt").length).toBe(promptCountBefore)
   })
 
+  it("keeps the live agy session when the client later swaps an older image for text", async () => {
+    const dir = makeTempDir("image-elided-")
+    const eventsFile = path.join(dir, "mock-agy.jsonl")
+    process.env.MOCK_AGY_EVENTS_FILE = eventsFile
+    const daemon = await startDaemon({ stateDir: dir, findAgy: () => MOCK_AGY, skipSignInCheck: true, exitOnShutdown: false })
+    cleanups.push(() => daemon.shutdown())
+    const headers = {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${daemon.authKey}`,
+      "x-agy-hook-session": "ses_image_elided",
+      "x-cwd": "/tmp/demo-repo",
+    }
+    const tools = [{
+      name: "read_file",
+      description: "Read a file",
+      input_schema: { type: "object", properties: { path: { type: "string" } }, required: ["path"] },
+    }]
+    const post = (messages) => fetch(`http://127.0.0.1:${daemon.port}/v1/messages`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ model: "claude-opus-4-6-thinking", max_tokens: 1024, stream: false, tools, messages }),
+    })
+    const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="
+
+    const r1 = await post([{ role: "user", content: "Please CALL_TOOL:read_file" }])
+    expect(r1.status).toBe(200)
+    const msg1 = await r1.json()
+    const toolUse = msg1.content.find((b) => b.type === "tool_use")
+    expect(toolUse?.name).toBe("read_file")
+
+    const withImage = [
+      { role: "user", content: "Please CALL_TOOL:read_file" },
+      { role: "assistant", content: msg1.content },
+      {
+        role: "user",
+        content: [{
+          type: "tool_result",
+          tool_use_id: toolUse.id,
+          content: [{ type: "text", text: "page 1" }, { type: "image", source: { type: "base64", media_type: "image/png", data: png } }],
+        }],
+      },
+    ]
+    const r2 = await post(withImage)
+    expect(r2.status).toBe(200)
+    const msg2 = await r2.json()
+    const firstSessionId = readMockEvents(eventsFile).find((e) => e.event === "session/new")?.sessionId
+    expect(firstSessionId).toBeTruthy()
+
+    // The client now sends the same conversation with that image replaced by a note.
+    const elided = structuredClone(withImage)
+    elided[2].content[0].content[1] = { type: "text", text: "[image omitted to stay under the request limit]" }
+    const r3 = await post([...elided, { role: "assistant", content: msg2.content }, { role: "user", content: "Follow up after image elided" }])
+    expect(r3.status).toBe(200)
+    const msg3 = await r3.json()
+    const reply3 = msg3.content.filter((b) => b.type === "text").map((b) => b.text).join("")
+    expect(reply3).toContain(`MAIN_REPLY:${firstSessionId}:Follow up after image elided`)
+
+    const events = readMockEvents(eventsFile)
+    expect(events.filter((e) => e.event === "session/new").length).toBe(1)
+    expect(events.some((e) => e.event === "session/resume")).toBe(false)
+  })
+
   it("handles mid-turn toolsGrew in-session without killing the agy process", async () => {
     const dir = makeTempDir("toolsgrew-")
     const eventsFile = path.join(dir, "mock-agy.jsonl")
