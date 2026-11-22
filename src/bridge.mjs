@@ -1190,8 +1190,14 @@ export class AgyBridge {
     const base = turn.baseHistory
     if (!Array.isArray(history) || !Array.isArray(base)) return null
     const ids = new Set(turn.calls.map((call) => call.id))
-    const carried = (opts.messages || []).some((message) => Array.isArray(message?.content) &&
-      message.content.some((block) => block?.type === "tool_use" && ids.has(block.id)))
+    const blocks = (opts.messages || []).flatMap((message) => Array.isArray(message?.content) ? message.content : [])
+    const carriedIds = blocks.filter((block) => block?.type === "tool_use" && ids.has(block.id)).map((block) => block.id)
+    // The client answered every call of this turn it carries and went on past them
+    // (e.g. a gateway in front replied in the bridge's place): the turn is over for
+    // the client, so the request moves on from it instead of conflicting with it.
+    const answered = new Set(blocks.filter((block) => block?.type === "tool_result").map((block) => block.tool_use_id))
+    if (carriedIds.length && carriedIds.every((id) => answered.has(id))) return "answered"
+    const carried = carriedIds.length > 0
     if (history.length < base.length || historyKey(history.slice(0, base.length)) !== historyKey(base)) {
       if (carried) return "conflict"
       return opts.hasToolResults ? null : "fork"
@@ -1453,11 +1459,17 @@ export class AgyBridge {
       }
       if (!proc.dead && proc.turn && !proc.retiring) {
         const lineage = this.#lineageVerdict(proc, proc.turn, opts)
-        if (lineage === "fork") {
+        if (lineage === "fork" || lineage === "answered") {
           // Only reclaim if the new request truly supersedes that turn (not a branch side-call).
-          if (!this.#shouldIsolateBranch(convKey, outerSession, opts, isFreshConversation)) {
+          // A request that answered this turn's calls itself has gone past the turn, so the
+          // running turn does not make it a side-call; a non-streaming one beside a
+          // streaming primary still is.
+          const supersedes = lineage === "answered"
+            ? !(opts.nonstream && !proc.nonstream)
+            : !this.#shouldIsolateBranch(convKey, outerSession, opts, isFreshConversation)
+          if (supersedes) {
             const orphan = proc.turn
-            this.logBridgeEvent(proc, orphan, "superseded", "lineage_fork", opts, { superseded_turn_id: orphan.turnId })
+            this.logBridgeEvent(proc, orphan, "superseded", lineage === "answered" ? "answered_by_client" : "lineage_fork", opts, { superseded_turn_id: orphan.turnId })
             await this.#reclaimStaleTurn(proc, orphan, SUPERSEDED_NOTE)
           }
         } else if (lineage === "conflict") {

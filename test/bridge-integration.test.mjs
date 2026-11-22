@@ -833,6 +833,83 @@ describe("AgyBridge integration (mock agy ACP + daemon)", () => {
     expect(events.filter((e) => e.event === "session/prompt").length).toBe(1)
   })
 
+  it("moves on when the client answered the pending tool call itself and the conversation went on without the bridge", async () => {
+    const dir = makeTempDir("answered-elsewhere-")
+    const eventsFile = path.join(dir, "mock-agy.jsonl")
+    process.env.MOCK_AGY_EVENTS_FILE = eventsFile
+
+    const daemon = await startDaemon({
+      stateDir: dir,
+      findAgy: () => MOCK_AGY,
+      skipSignInCheck: true,
+      skipInfoFile: true,
+      exitOnShutdown: false,
+    })
+    cleanups.push(() => daemon.shutdown())
+
+    const post = (messages) => fetch(`http://127.0.0.1:${daemon.port}/v1/messages`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${daemon.authKey}`,
+        "x-agy-hook-session": "ses_answered_elsewhere",
+        "x-cwd": "/tmp/demo-repo",
+      },
+      body: JSON.stringify({
+        model: "claude-opus-4-6-thinking",
+        max_tokens: 1024,
+        stream: true,
+        tools: [{ name: "bash", description: "Bash", input_schema: { type: "object", properties: { path: { type: "string" } } } }],
+        messages,
+      }),
+    })
+    const opening = { role: "user", content: "Please CALL_TOOL:bash THEN_TOOL:bash" }
+    const m1 = await parseSseToJson(await post([opening]))
+    const use1 = m1.content.find((b) => b.type === "tool_use")
+    const turn1 = [opening, { role: "assistant", content: m1.content }, { role: "user", content: [{ type: "tool_result", tool_use_id: use1.id, content: "out 1" }] }]
+    const m2 = await parseSseToJson(await post(turn1))
+    const use2 = m2.content.find((b) => b.type === "tool_use")
+    expect(use2).toBeTruthy()
+
+    // A gateway in front (Magpie's loop guard) answers the next request itself, so the
+    // bridge never sees the result of use2; the client then keeps talking.
+    const history3 = [
+      ...turn1,
+      { role: "assistant", content: m2.content },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: use2.id, content: "out 2" }] },
+      { role: "assistant", content: [{ type: "text", text: "This turn was stopped before it reached the model." }] },
+      { role: "user", content: "continue" },
+    ]
+    const r3 = await post(history3)
+    const body = await r3.text()
+    expect(body).not.toContain("carries the pending tool call")
+    expect(r3.status).toBe(200)
+
+    // The stuck turn was closed and the conversation goes on as the primary session,
+    // not as a side branch beside a session that stays stuck.
+    const procs = [...daemon.bridge.pool.values()].filter((p) => !p.dead && !p.retiring)
+    expect(procs.length).toBe(1)
+    expect(procs[0].role).toBe("primary")
+
+    // The next turn continues on that session.
+    const m3 = await parseSseToJson(new Response(body))
+    const r4 = await post([...history3, { role: "assistant", content: m3.content }, { role: "user", content: "and again" }])
+    expect(r4.status).toBe(200)
+    await r4.text()
+
+    // agy went on in its own session (reopened, not replaced), was told what the
+    // client did in its place, and the next turn needed no new process.
+    const events = readMockEvents(eventsFile)
+    expect(events.filter((e) => e.event === "session/new").length).toBe(1)
+    expect(events.filter((e) => e.event === "session/resume").length).toBe(1)
+    expect(events.filter((e) => e.event === "acp_start").length).toBe(2)
+    const prompts = events.filter((e) => e.event === "session/prompt").map((e) => e.promptText)
+    expect(prompts.length).toBe(3)
+    expect(prompts[1]).toContain("out 2")
+    expect(prompts[1]).toContain("continue")
+    expect(prompts[2]).toContain("and again")
+  })
+
   it("keeps stepUsageTrusted alive across transient missed steps and avoids 0.5x scale inflation on compacted sessions", async () => {
     const dir = makeTempDir("compacted-usage-")
     const convDir = path.join(dir, "conversations")
