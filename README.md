@@ -20,6 +20,7 @@ Long agentic sessions using the stock `@magpie-community/opencode-agy-cli-auth` 
   - Recognizes `[System] Showing lines ...` and related companion notices without triggering `userSteered`.
   - Allows `session/resume` even when history contains completed `tool_result` turns.
   - Keeps the live session when the client later replaces an older image with a text note (Claude Code and Magpie do this to stay under request limits): agy already holds the image, so it is still the same conversation and its prompt cache.
+  - Keeps every tool the client declares. agy passes the model at most about 60 KB of tool definitions and silently leaves out the largest tools past that; when the tools are over the limit, the longest descriptions are shortened until they fit, and their full text goes into the session's system prompt (or, for a tool added later, the next prompt).
   - Updates dynamically added tools (`toolsGrew`) in-session via `steerInSession` + `updateTools`.
   - Deduplicates identical completed-turn HTTP retries via `CompletedTurnCache`.
   - Expands initial prompt budget to `136 KiB` on `agy >= 1.5.8` and extends idle/detached eviction windows (`IDLE_MS=30m`, `DETACHED_EVICT_MS=15m`, `TOOL_RESULT_TIMEOUT_MS=30m`).
@@ -51,6 +52,7 @@ Ensure `agy` CLI (`>= 1.4.12`, recommended `>= 1.5.8`) is installed and signed i
 | `AGY_BOOST_USER_MCP` | unset | `1` lets `agy acp` start the MCP servers in `~/.gemini/config/mcp_config.json`. By default the bridge runs agy with `--gemini-dir` pointing at a private copy of `~/.gemini` (links, plus an empty `mcp_config.json`): the bridge's agent never uses those servers, but agy would start all of them for every session. Not used on Windows |
 | `AGY_BOOST_ERROR_PEEK_MS` | `20000` (20s) | How long a streamed response waits for its first event before sending headers. An error that comes first (including a quota notice agy passes on as the reply's text) is answered with its HTTP status, e.g. 429, so the client can fail over |
 | `AGY_BOOST_SUPERSEDED_CHECK_MS` | `60000` (1 min) | How often a daemon checks whether another one has taken over its state dir; an idle one that has been replaced exits |
+| `AGY_BOOST_TOOL_BUDGET_BYTES` | `50000` | Size the tool definitions handed to agy are kept under (agy's own limit is about 60,000 bytes); longer descriptions are shortened and their full text given to the model in the system prompt |
 | `AGY_BOOST_RESUME_TTL_MS` | `86400000` (24h) | Checkpoint retention window for `session/resume` |
 | `AGY_BOOST_DAEMON_IDLE_MS` | `14400000` (4h) | Daemon auto-exit delay when pool is empty and idle |
 

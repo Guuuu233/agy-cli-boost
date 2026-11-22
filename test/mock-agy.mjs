@@ -121,7 +121,12 @@ async function handlePrompt(id, params) {
     .map((p) => p.text)
     .join("\n")
 
-  record({ event: "session/prompt", sessionId: sid, promptText: promptText.slice(0, 300) })
+  record({
+    event: "session/prompt",
+    sessionId: sid,
+    promptText: promptText.slice(0, 300),
+    markers: promptText.match(/SECRET-[A-Z0-9]+/g) || [],
+  })
 
   try {
     // Trigger an MCP tool call if prompt asks for CALL_TOOL:<name>
@@ -305,9 +310,24 @@ process.stdin.on("data", (chunk) => {
     if (msg.method === "session/new") {
       sessionCounter++
       currentSessionId = `mock-sess-${process.pid}-${sessionCounter}`
-      record({ event: "session/new", sessionId: currentSessionId, cwd: msg.params?.cwd })
+      const newSid = currentSessionId
+      record({
+        event: "session/new",
+        sessionId: newSid,
+        cwd: msg.params?.cwd,
+        systemAppend: msg.params?._meta?.antigravity?.systemPrompt?.append ?? null,
+      })
       startWatch()
-      controlCall("list").catch(() => {})
+      controlCall("list").then((res) => {
+        const tools = res?.result?.tools || []
+        const plain = tools.map(({ name, description, inputSchema }) => ({ name, description, inputSchema }))
+        record({
+          event: "mcp/list-at-start",
+          sessionId: newSid,
+          tools: tools.map((t) => t.name),
+          bytes: plain.reduce((sum, t) => sum + Buffer.byteLength(JSON.stringify(t), "utf8"), 0),
+        })
+      }).catch(() => {})
       send({
         jsonrpc: "2.0",
         id: msg.id,

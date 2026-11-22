@@ -20,6 +20,7 @@
   - 将 `[System] Showing lines ...` 等分页/状态提示识别为非打断型 companion notice。
   - 允许在包含历史 `tool_result` 的对话中通过 `session/resume` 恢复完整上下文。
   - 客户端后来把较早的图片换成文字说明时（Claude Code 和 Magpie 为避免超出请求大小限制会这样做），继续沿用正在用的会话：agy 已经有这些图片，仍是同一段对话，提示词缓存照样能命中。
+  - 客户端声明的工具一个不丢。agy 交给模型的工具定义最多约 60 KB，超出时会悄悄去掉最大的那几个工具；工具超限时，插件从最长的说明开始缩短直到放得下，被缩短部分的全文放进会话的系统提示（会话中途新加的工具则随下一条消息给出）。
   - 工具列表在回合中增长（`toolsGrew`）时通过 `steerInSession` + `updateTools` 会话内热更新。
   - 通过 `CompletedTurnCache` 对已完成回合的 HTTP 重试直接去重返回。
   - `agy >= 1.5.8` 初始提示词预算提升至 `136 KiB`，并放宽空闲与脱离连接的回收窗口（`IDLE_MS=30m`、`DETACHED_EVICT_MS=15m`、`TOOL_RESULT_TIMEOUT_MS=30m`）。
@@ -51,6 +52,7 @@
 | `AGY_BOOST_USER_MCP` | 不设置 | 设为 `1` 时 `agy acp` 照常启动 `~/.gemini/config/mcp_config.json` 里的 MCP。默认情况下，桥接用 `--gemini-dir` 指向 `~/.gemini` 的私有副本（全部链接回原目录，只有 `mcp_config.json` 为空）运行 agy：桥接的 agent 从不使用这些 MCP，但 agy 会为每个会话全部启动一遍。Windows 不启用 |
 | `AGY_BOOST_ERROR_PEEK_MS` | `20000`（20 秒） | 流式回复发出响应头前等待第一个事件的最长时间。若第一个事件是错误（包括 agy 当作回答文字转来的额度提示），直接以对应 HTTP 状态（如 429）返回，客户端可据此切换线路 |
 | `AGY_BOOST_SUPERSEDED_CHECK_MS` | `60000`（1 分钟） | 后台多久检查一次状态目录是否已被另一个后台接管；被替换且空闲的后台会自行退出 |
+| `AGY_BOOST_TOOL_BUDGET_BYTES` | `50000` | 交给 agy 的工具定义总大小上限（agy 自身上限约 60,000 字节）；超出时缩短较长的说明，全文通过系统提示交给模型 |
 | `AGY_BOOST_RESUME_TTL_MS` | `86400000`（24 小时） | `session/resume` 检查点有效期 |
 | `AGY_BOOST_DAEMON_IDLE_MS` | `14400000`（4 小时） | 进程池全空且无请求后守护进程自动退出的空闲时长 |
 

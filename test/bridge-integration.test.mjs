@@ -411,6 +411,71 @@ describe("AgyBridge integration (mock agy ACP + daemon)", () => {
     expect(events.some((e) => e.event === "session/resume")).toBe(false)
   })
 
+  it("keeps every tool when the tools are over agy's size limit and gives the model their full text", async () => {
+    const dir = makeTempDir("tool-budget-")
+    const eventsFile = path.join(dir, "mock-agy.jsonl")
+    process.env.MOCK_AGY_EVENTS_FILE = eventsFile
+    const daemon = await startDaemon({ stateDir: dir, findAgy: () => MOCK_AGY, skipSignInCheck: true, exitOnShutdown: false })
+    cleanups.push(() => daemon.shutdown())
+    const post = (session, messages, tools) => fetch(`http://127.0.0.1:${daemon.port}/v1/messages`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${daemon.authKey}`,
+        "x-agy-hook-session": session,
+        "x-cwd": "/tmp/demo-repo",
+      },
+      body: JSON.stringify({ model: "claude-opus-4-6-thinking", max_tokens: 1024, stream: false, system: "You are a test assistant.", tools, messages }),
+    })
+    const tool = (name, secret, repeat = 300) => ({
+      name,
+      description: `Tool ${name}. ` + "Long guidance sentence for testing. ".repeat(repeat) + ` SECRET-${secret}`,
+      input_schema: { type: "object", properties: { code: { type: "string", description: "input" } }, required: ["code"] },
+    })
+    const waitFor = async (pred) => {
+      for (let i = 0; i < 50; i++) {
+        const hit = readMockEvents(eventsFile).find(pred)
+        if (hit) return hit
+        await new Promise((r) => setTimeout(r, 20))
+      }
+      return null
+    }
+
+    // 27 tools of ~11 KB each: agy itself would keep only 5 of them.
+    const tools = Array.from({ length: 27 }, (_, i) => tool(`t${String(i).padStart(2, "0")}`, `T${i}`))
+    const m1 = [{ role: "user", content: "hello" }]
+    const r1 = await post("ses_tool_budget", m1, tools)
+    expect(r1.status).toBe(200)
+    const msg1 = await r1.json()
+
+    const listed = await waitFor((e) => e.event === "mcp/list-at-start")
+    expect(listed.tools).toEqual(tools.map((t) => t.name))
+    expect(listed.bytes).toBeLessThanOrEqual(50_000)
+    const started = readMockEvents(eventsFile).find((e) => e.event === "session/new")
+    expect(started.systemAppend).toContain("You are a test assistant.")
+    expect(started.systemAppend).toContain("# Full tool descriptions")
+    expect(started.systemAppend).toContain("SECRET-T0")
+    expect(started.systemAppend).toContain("SECRET-T26")
+
+    // A tool added later in the same conversation: its full text comes with the next prompt, once.
+    const r2 = await post("ses_tool_budget", [...m1, { role: "assistant", content: msg1.content }, { role: "user", content: "again" }],
+      [...tools, tool("t27", "NEW")])
+    expect(r2.status).toBe(200)
+    await r2.json()
+    const events = readMockEvents(eventsFile)
+    expect(events.filter((e) => e.event === "session/new").length).toBe(1)
+    const prompts = events.filter((e) => e.event === "session/prompt")
+    expect(prompts.at(-1).markers).toEqual(["SECRET-NEW"])
+
+    // Tools well under the limit are passed on unchanged, with no extra system text.
+    const r3 = await post("ses_tool_budget_small", [{ role: "user", content: "small" }], [tool("s1", "S1", 5)])
+    expect(r3.status).toBe(200)
+    await r3.json()
+    const small = readMockEvents(eventsFile).filter((e) => e.event === "session/new").at(-1)
+    expect(small.systemAppend).not.toContain("Full tool descriptions")
+    expect(small.systemAppend).toContain("You are a test assistant.")
+  })
+
   it("handles mid-turn toolsGrew in-session without killing the agy process", async () => {
     const dir = makeTempDir("toolsgrew-")
     const eventsFile = path.join(dir, "mock-agy.jsonl")

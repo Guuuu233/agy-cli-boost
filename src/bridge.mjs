@@ -24,6 +24,7 @@ import { buildGeminiShadow } from "./helper/gemini-shadow.mjs"
 import { spawnAgy, windowsMcpShim, windowsNcBuild, windowsTreeKill } from "./helper/platform.mjs"
 import { cannotSignIn, readStoredSignIn, storedSignInNow } from "./helper/signin.mjs"
 import { modelUsageAfter, modelUsageCursor, sessionDbPath } from "./helper/step-usage.mjs"
+import { fitTools, renderToolNotes, toolBudgetBytes, toolNoteKey } from "./helper/tool-budget.mjs"
 import { classifyUpstreamFailure, couldBeUpstreamFailure } from "./helper/upstream-failure.mjs"
 import {
   AgentTurnError,
@@ -2598,6 +2599,12 @@ class Proc {
     this.selection = opts.selection
     this.tools = opts.tools
     this.toolsSignature = toolsSignature(opts.tools)
+    // What agy is shown when the tools are over its size limit, and the full
+    // text of what was shortened: already with the model, or still to be sent.
+    this.toolFit = null
+    this.startToolNotes = null
+    this.toolNotesSent = new Set()
+    this.toolNotesToSend = []
     this.workDir = opts.workDir
     this.instructions = opts.instructions || ""
     this.userId = opts.userId || ""
@@ -2662,6 +2669,8 @@ class Proc {
     await fs.promises.mkdir(agentDir, { recursive: true })
     await fs.promises.writeFile(path.join(agentDir, "agent.md"), agentDefinition(), { mode: 0o600 })
     this.logPath = path.join(this.workspace, "agy-acp.log")
+    // Before agy starts, so its first tools/list already gets the fitted tools.
+    this.startToolNotes = this.#fitTools()
 
     const args = [
       "acp",
@@ -2745,9 +2754,16 @@ class Proc {
     const appendable = capabilities._meta?.antigravity?.systemPrompt?.append === true
     const resumable = !!(capabilities.sessionCapabilities?.resume ?? capabilities.session_capabilities?.resume)
     this.instructionsInSession = appendable && !!this.instructions
-    const meta = this.instructionsInSession
-      ? { _meta: { antigravity: { systemPrompt: { append: outgoing(this.instructions) } } } }
-      : {}
+    // Shortened tool texts go in full into the system prompt, which agy does
+    // not limit; an agy that takes no system text gets them with the first prompt.
+    const notes = this.startToolNotes ?? this.#fitTools()
+    const append = [
+      this.instructionsInSession ? outgoing(this.instructions) : "",
+      appendable && notes.length ? outgoing(renderToolNotes(notes)) : "",
+    ].filter(Boolean).join("\n\n")
+    if (appendable) this.#noteToolTextsSent(notes)
+    else this.#queueToolTexts(notes)
+    const meta = append ? { _meta: { antigravity: { systemPrompt: { append } } } } : {}
 
     let session = null
     if (this.resumeFrom && resumable) {
@@ -2845,7 +2861,43 @@ class Proc {
       waiter.resolve()
     }
     this.listWaiters = this.listWaiters.filter((item) => item.version > this.listedVersion)
-    return this.tools.map((tool) => ({ ...tool, _meta: { ...tool._meta, [ALWAYS_LOAD]: true } }))
+    return (this.toolFit?.tools ?? this.tools).map((tool) => ({ ...tool, _meta: { ...tool._meta, [ALWAYS_LOAD]: true } }))
+  }
+
+  // Fit the tools to agy's size limit; returns the texts that were shortened.
+  #fitTools() {
+    const fit = fitTools(this.tools, toolBudgetBytes())
+    this.toolFit = fit.notes.length ? fit : null
+    if (fit.notes.length || !fit.fits) {
+      this.bridge.logSessionEvent(this, "tools_fitted", fit.fits ? "over_agy_limit" : "still_over_agy_limit", {
+        tools: this.tools.length,
+        bytes_before: fit.before,
+        bytes_after: fit.after,
+        shortened: fit.notes.length,
+      })
+    }
+    return fit.notes
+  }
+
+  #noteToolTextsSent(notes) {
+    for (const note of notes) this.toolNotesSent.add(toolNoteKey(note))
+  }
+
+  #queueToolTexts(notes) {
+    const queued = new Set(this.toolNotesToSend.map(toolNoteKey))
+    for (const note of notes) {
+      const key = toolNoteKey(note)
+      if (!this.toolNotesSent.has(key) && !queued.has(key)) this.toolNotesToSend.push(note)
+    }
+  }
+
+  // Full texts of shortened tools the model has not been given yet, as a prompt part.
+  #takeToolTexts() {
+    if (!this.toolNotesToSend.length) return []
+    const notes = this.toolNotesToSend
+    this.toolNotesToSend = []
+    this.#noteToolTextsSent(notes)
+    return [{ type: "text", text: `<system-reminder>\n${renderToolNotes(notes)}\n</system-reminder>` }]
   }
 
   addWatcher(socket) {
@@ -2863,6 +2915,7 @@ class Proc {
     if (signature === this.toolsSignature) return
     this.tools = tools
     this.toolsSignature = signature
+    this.#queueToolTexts(this.#fitTools())
     await this.#announceTools()
   }
 
@@ -3033,7 +3086,7 @@ class Proc {
       turn.stepsFile = stepUsageEnabled ? sessionDbPath(this.sessionId) : null
       turn.stepCursor = turn.stepsFile ? modelUsageCursor(turn.stepsFile) : null
       if (turn.stepsFile && turn.stepCursor === null) this.stepUsageTrusted = false
-      let promptParts = mergePromptParts(this.unsentPrompt, toPromptParts(content))
+      let promptParts = mergePromptParts(this.unsentPrompt, mergePromptParts(this.#takeToolTexts(), toPromptParts(content)))
       this.unsentPrompt = null
       let usage = null
       let lateCalls = null
