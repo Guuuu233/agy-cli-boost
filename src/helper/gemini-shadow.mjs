@@ -1,6 +1,7 @@
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
+import { agyHomeOf } from "../instance.mjs"
 
 // agy starts every MCP server in <gemini dir>/config/mcp_config.json when a
 // session opens, whatever the agent may use. The bridge's agent inherits no
@@ -35,7 +36,7 @@ function linkEntries(fromDir, toDir, skip) {
 // Builds <stateDir>/gemini-shadow afresh and returns it, or null when agy
 // should keep its own gemini dir: Windows (symlinks need a privilege), no
 // MCP servers to leave out, or AGY_BOOST_USER_MCP=1.
-export function buildGeminiShadow(stateDir, { source = path.join(os.homedir(), ".gemini"), env = process.env, platform = process.platform } = {}) {
+export function buildGeminiShadow(stateDir, { env = process.env, source = path.join(agyHomeOf(os.homedir(), env), ".gemini"), platform = process.platform } = {}) {
   if (env.AGY_BOOST_USER_MCP === "1" || platform === "win32") return null
   const realConfig = path.join(source, "config")
   if (!hasServers(path.join(realConfig, "mcp_config.json"))) return null

@@ -42,6 +42,9 @@ export function computeCodeFingerprint(rootDir = path.resolve(import.meta.dir ||
       }
     }
     walk(srcDir)
+    // a changed instance.json (another HOME) needs a new daemon too
+    const own = fs.statSync(path.join(rootDir, "instance.json"), { throwIfNoEntry: false })
+    if (own) entries.push(`instance.json:${own.size}:${Math.trunc(own.mtimeMs)}`)
     entries.sort()
     return `${pkg.version || "0.0.0"}:${entries.join("|")}`
   } catch {

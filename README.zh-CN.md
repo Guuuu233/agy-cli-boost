@@ -41,11 +41,28 @@
 
 使用前请确保本机已安装 `agy` CLI（`>= 1.4.12`，推荐 `>= 1.5.8`）并完成账号登录。
 
+### 同时使用第二个 Google 账号（Linux）
+
+一份插件对应一个 Google 账号：agy 把登录信息存在 `$HOME/.gemini` 下。要同时用另一个账号，把插件再复制一份到单独的文件夹（不要放在 Magpie 的 `node_modules` 里），并在它的 `package.json` 旁边放一个 `instance.json`：
+
+```json
+{ "id": "agy-cli-2", "name": "Antigravity 2 (agy CLI)", "agyHome": "/home/me/agy-accounts/2" }
+```
+
+- `id`：Magpie 里这个供应商的 ID，模型名会是 `agy-cli-2/gemini-4-neon` 这样。只能用小写字母、数字和 `-`。
+- `agyHome`：这份插件启动的所有 agy 使用的 `HOME`（不存在会自动创建）。登录信息、会话和缓存都只属于这个账号。
+- `name`（可选）：在 Magpie 里显示的供应商名称。
+
+这份插件有自己的守护进程、密钥和状态目录（`~/.local/state/magpie-agy-cli-boost-<id>`）。用 `magpie plugin add <文件夹>` 加入，用 `magpie plugin login agy-cli-2` 登录，再把两个供应商的模型放进同一个路由组，一个账号限流时就会转给另一个。没有 `instance.json` 的那份就是平常的 `agy-cli`。`instance.json` 写错时，这份插件会直接加载失败，不会退回成 `agy-cli`。
+
+macOS 和 Windows 上 agy 把登录信息存在系统钥匙串里，换 `HOME` 改变不了，所以在这两个系统上两份插件仍是同一个账号。
+
 ## 环境变量
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `AGY_BOOST_STATE_DIR` | `~/.local/state/magpie-agy-cli-boost` | 私有状态目录（`0700`），存放 `daemon.json`、`daemon.key`、`checkpoints.json`、`models.json` |
+| `AGY_BOOST_STATE_DIR` | `~/.local/state/magpie-agy-cli-boost`（第二份插件为 `…-<id>`） | 私有状态目录（`0700`），存放 `daemon.json`、`daemon.key`、`checkpoints.json`、`models.json` |
+| `AGY_BOOST_INSTANCE_FILE` | `<插件文件夹>/instance.json` | 从哪里读这份插件的实例设置（见「同时使用第二个 Google 账号」） |
 | `AGY_BOOST_IDLE_MS` | `1800000`（30 分钟） | 空闲 `agy acp` 进程保留时长 |
 | `AGY_BOOST_DETACHED_EVICT_MS` | `900000`（15 分钟） | 进程池满时可驱逐断连工具回合的最短保留时长 |
 | `AGY_BOOST_TOOL_TIMEOUT_MS` | `1800000`（30 分钟） | 等待客户端回传 `tool_result` 的超时时间 |

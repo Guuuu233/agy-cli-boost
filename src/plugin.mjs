@@ -7,6 +7,7 @@ import { computeCodeFingerprint, daemonPaths, ensureDaemonKey, PROTOCOL_VERSION 
 import { startLogin } from "./helper/login.mjs"
 import { forgetStoredSignIn } from "./helper/signin.mjs"
 import { createUsageReader } from "./helper/usage.mjs"
+import { instance } from "./instance.mjs"
 import { sanitizeInputSchema } from "./protocol.mjs"
 import {
   defaultStateDir,
@@ -15,7 +16,8 @@ import {
   readPrivateFileSync,
 } from "./state-security.mjs"
 
-export const PROVIDER_ID = "agy-cli"
+// "agy-cli", or this copy's own id (instance.mjs)
+export const PROVIDER_ID = instance().id
 export const NPM_ANTHROPIC = "@ai-sdk/anthropic"
 
 const DAEMON_ENTRY = fileURLToPath(new URL("./daemon.mjs", import.meta.url))
@@ -309,7 +311,17 @@ export const AntigravityBridgePlugin = async () => {
     return warmPromise
   }
 
+  const providerName = instance().name
   return {
+    // An instance with a name (instance.json) is listed by it, so two copies
+    // aren't two rows of the same id-like name; a name the user set stays.
+    ...(providerName ? {
+      config: async (cfg) => {
+        cfg.provider ??= {}
+        const was = cfg.provider[PROVIDER_ID] ?? {}
+        cfg.provider[PROVIDER_ID] = { npm: NPM_ANTHROPIC, ...was, name: was.name || providerName }
+      },
+    } : {}),
     "chat.headers": async (input, output) => {
       if (input?.sessionID && output?.headers && typeof output.headers === "object") {
         output.headers["x-agy-hook-session"] = String(input.sessionID)

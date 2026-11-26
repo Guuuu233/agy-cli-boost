@@ -2,11 +2,15 @@ import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import { randomBytes, randomUUID } from "node:crypto"
+import { instance } from "./instance.mjs"
 
+// The default instance keeps its old dir; another instance (instance.mjs)
+// gets its own, so it never shares a daemon, key or checkpoints with it.
 export function defaultStateDir(env = process.env) {
   if (env.AGY_BOOST_STATE_DIR) return path.resolve(env.AGY_BOOST_STATE_DIR)
   const base = env.XDG_STATE_HOME || path.join(os.homedir(), ".local", "state")
-  return path.join(base, "magpie-agy-cli-boost")
+  const own = instance(env)
+  return path.join(base, own.isDefault ? "magpie-agy-cli-boost" : `magpie-agy-cli-boost-${own.id}`)
 }
 
 export function assertNoSymlinkPath(targetPath, finalKind = "any") {

@@ -16,6 +16,7 @@ import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import { pathToFileURL } from "node:url"
+import { agyHomeOf } from "../instance.mjs"
 
 const MODEL_STEP = 15
 const STEP_DONE = 3
@@ -70,7 +71,7 @@ function loadOpener() {
 
 export function conversationsDir(env = process.env) {
   return env.AGY_BRIDGE_CONVERSATIONS_DIR ||
-    path.join(os.homedir(), ".gemini", "antigravity-cli", "conversations")
+    path.join(agyHomeOf(os.homedir(), env), ".gemini", "antigravity-cli", "conversations")
 }
 
 export function sessionDbPath(sessionId, env = process.env) {

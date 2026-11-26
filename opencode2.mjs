@@ -21,6 +21,7 @@
 
 import { readFileSync } from "node:fs"
 import * as v1 from "./opencode.mjs"
+import { instance } from "./src/instance.mjs"
 
 const pkg = JSON.parse(readFileSync(new URL("./package.json", import.meta.url), "utf8"))
 
@@ -617,4 +618,7 @@ export async function setup(ctx, mod = v1) {
   }
 }
 
-export default { id: pkg.name, setup: (ctx) => setup(ctx) }
+// a second copy (instance.json) is a plugin of its own id, so a host that
+// keys plugins by id keeps both
+const own = instance()
+export default { id: own.isDefault ? pkg.name : `${pkg.name}-${own.id}`, setup: (ctx) => setup(ctx) }

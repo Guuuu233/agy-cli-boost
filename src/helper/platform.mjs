@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process"
 import os from "node:os"
 import path from "node:path"
+import { instance } from "../instance.mjs"
 
 // Whether dir is the user's home folder or a folder above it ("/", "C:\Users");
 // on Windows case aside, as the system ignores it. agy loads what a workspace
@@ -99,6 +100,16 @@ export function childEnv(parent = process.env, extra = {}, platform = process.pl
   }
   if (![...names.keys()].some(name => name.toUpperCase() === "AGY_CLI_DISABLE_AUTO_UPDATE")) {
     env.AGY_CLI_DISABLE_AUTO_UPDATE = "true"
+  }
+  // An instance with a HOME of its own (instance.mjs) runs every agy there:
+  // its sign-in, sessions and caches are that account's alone.
+  const agyHome = instance(parent).agyHome
+  if (agyHome) {
+    for (const key of Object.keys(env)) {
+      if (/^(home|userprofile)$/i.test(key)) delete env[key]
+    }
+    env.HOME = agyHome
+    if (platform === "win32") env.USERPROFILE = agyHome
   }
   return env
 }

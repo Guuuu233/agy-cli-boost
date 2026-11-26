@@ -41,11 +41,28 @@ Install directly from GitHub in Magpie Plugin Settings or `~/.config/magpie/plug
 
 Ensure `agy` CLI (`>= 1.4.12`, recommended `>= 1.5.8`) is installed and signed in (`agy` or Magpie's OAuth flow).
 
+### A second Google account at once (Linux)
+
+One copy of the plugin serves one Google account: agy keeps its sign-in under `$HOME/.gemini`. To serve another account beside it, put a second copy of the plugin in a folder of its own (not under Magpie's `node_modules`) with an `instance.json` next to its `package.json`:
+
+```json
+{ "id": "agy-cli-2", "name": "Antigravity 2 (agy CLI)", "agyHome": "/home/me/agy-accounts/2" }
+```
+
+- `id`: the provider id Magpie lists its models under (`agy-cli-2/gemini-4-neon`, …). Lowercase letters, digits and `-`.
+- `agyHome`: the `HOME` every agy of this copy runs with (created if missing). Its sign-in, sessions and caches are this account's alone.
+- `name` (optional): the provider's name in Magpie.
+
+The copy gets its own daemon, key and state dir (`~/.local/state/magpie-agy-cli-boost-<id>`). Add it with `magpie plugin add <folder>`, sign in with `magpie plugin login agy-cli-2`, and put both providers' models in one routing group so a rate-limited account hands over to the other. A copy without `instance.json` is the usual `agy-cli`. An `instance.json` that isn't valid stops the copy from loading rather than letting it fall back to `agy-cli`.
+
+On macOS and Windows agy keeps the sign-in in the system keyring, which a separate `HOME` does not change, so two copies there share one account.
+
 ## Configuration (Environment Variables)
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `AGY_BOOST_STATE_DIR` | `~/.local/state/magpie-agy-cli-boost` | Private (`0700`) state directory for `daemon.json`, `daemon.key`, `checkpoints.json`, and `models.json` |
+| `AGY_BOOST_STATE_DIR` | `~/.local/state/magpie-agy-cli-boost` (`…-<id>` for a second instance) | Private (`0700`) state directory for `daemon.json`, `daemon.key`, `checkpoints.json`, and `models.json` |
+| `AGY_BOOST_INSTANCE_FILE` | `<plugin folder>/instance.json` | Where the copy's instance settings are read from (see "A second Google account at once") |
 | `AGY_BOOST_IDLE_MS` | `1800000` (30m) | Idle `agy acp` process retention timeout |
 | `AGY_BOOST_DETACHED_EVICT_MS` | `900000` (15m) | Minimum detached tool-turn age before LRU eviction under pool pressure |
 | `AGY_BOOST_TOOL_TIMEOUT_MS` | `1800000` (30m) | Timeout waiting for client `tool_result` |
