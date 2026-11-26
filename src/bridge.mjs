@@ -21,11 +21,11 @@ import {
 } from "./catalog.mjs"
 import { hint, outgoing, turnsAway } from "./helper/cloak.mjs"
 import { buildGeminiShadow } from "./helper/gemini-shadow.mjs"
-import { spawnAgy, windowsMcpShim, windowsNcBuild, windowsTreeKill } from "./helper/platform.mjs"
+import { holdsHome, spawnAgy, windowsMcpShim, windowsNcBuild, windowsTreeKill } from "./helper/platform.mjs"
 import { cannotSignIn, readStoredSignIn, storedSignInNow } from "./helper/signin.mjs"
 import { modelUsageAfter, modelUsageCursor, sessionDbPath } from "./helper/step-usage.mjs"
 import { fitTools, renderToolNotes, toolBudgetBytes, toolNoteKey } from "./helper/tool-budget.mjs"
-import { classifyUpstreamFailure, couldBeUpstreamFailure } from "./helper/upstream-failure.mjs"
+import { classifyUpstreamFailure, couldBeUpstreamFailure, verifyLinkIn, verifyMessage } from "./helper/upstream-failure.mjs"
 import {
   AgentTurnError,
   BusyError,
@@ -158,6 +158,22 @@ const STEP_USAGE_POLL_MS = 25
 const TOOL_BATCH_WINDOW_MS = 30
 const AGENT_ERROR_MARKER = "\n⚠ Agent execution terminated due to error.\n"
 const AGENT_ERROR_CORE = AGENT_ERROR_MARKER.trim()
+// agy's other endings, written after whatever the model said this turn: a
+// banned account (1.5.9 and 1.5.10 wordings), one Google wants verified, a
+// model with no capacity, and a used-up quota. Each is a line of its own that
+// nothing follows; it is held from its start and read at the end of the
+// prompt (classifyUpstreamFailure), so it fails the turn instead of going out
+// as the reply.
+const ENDING_CORES = [
+  "⚠ PERMISSION_DENIED (code 403): This service has been disabled in this account for violation of Terms of Service.",
+  "⚠ This service has been disabled in this account for violation of Terms of Service.",
+  "⚠ Verification Required",
+  "⚠ Our servers are experiencing high traffic right now",
+  "⚠ Individual quota reached",
+  "⚠ Third-party quota reached",
+]
+const ENDING_MARKERS = ENDING_CORES.map((core) => "\n" + core)
+const HOLD_MAX = Math.max(AGENT_ERROR_MARKER.length, ...ENDING_MARKERS.map((marker) => marker.length)) - 1
 const STOP_REASONS = { end_turn: "end_turn", max_tokens: "max_tokens", max_turn_requests: "end_turn", refusal: "refusal" }
 const minimalAgent = () => process.env.AGY_BOOST_MINIMAL_AGENT === "1" || process.env.AGY_BRIDGE_MINIMAL_AGENT === "1"
 const FORWARD_THINKING = process.env.AGY_BRIDGE_THINKING !== "0"
@@ -310,8 +326,21 @@ async function fileSize(file) {
   try { return (await fs.promises.stat(file)).size } catch { return 0 }
 }
 
-async function lastAgentError(file, offset) {
-  let text = ""
+// The HTTP status of a turn's error: its own, else by its kind. A refused
+// account (permission_error) is 403 so the gateway rests the account; no
+// capacity (overloaded_error) is 503, tried again or elsewhere.
+function errorStatus(error) {
+  if (Number.isInteger(error?.status)) return error.status
+  const kind = error?.kind || "api_error"
+  if (kind === "rate_limit_error") return 429
+  if (kind === "invalid_request_error") return 400
+  if (kind === "permission_error") return 403
+  if (kind === "overloaded_error") return 503
+  return 502
+}
+
+// What agy logged since offset (at most LOG_TAIL_BYTES), "" when unreadable.
+async function readLogTail(file, offset) {
   try {
     const handle = await fs.promises.open(file, "r")
     try {
@@ -319,13 +348,18 @@ async function lastAgentError(file, offset) {
       const start = Math.max(offset || 0, size - LOG_TAIL_BYTES)
       const buffer = Buffer.alloc(Math.max(0, size - start))
       await handle.read(buffer, 0, buffer.length, start)
-      text = buffer.toString("utf8")
+      return buffer.toString("utf8")
     } finally {
       await handle.close()
     }
   } catch {
     return ""
   }
+}
+
+async function lastAgentError(file, offset) {
+  const text = await readLogTail(file, offset)
+  if (!text) return ""
   let found = ""
   for (const line of text.split("\n")) {
     const match = /\] (?:agent executor error|failed to construct executor): (.+)$/.exec(line)
@@ -490,6 +524,10 @@ class Turn {
     this.cancelledMcpSockets = new Set()
     this.agentError = false
     this.heldText = ""
+    // agy's ending, read from the end of the prompt's text (ENDING_CORES)
+    this.endingFailure = null
+    // the last character of text sent on since the last tool call
+    this.textTail = ""
     // the first text of the turn, held while it reads like a quota or
     // capacity error agy passed on as the reply (null: no longer held)
     this.upstreamHold = ""
@@ -616,6 +654,8 @@ class Turn {
       (this.upstreamHold || event.type === "tool")) {
       this.releaseUpstreamHold()
     }
+    if (event.type === "text" && event.text) this.textTail = event.text.slice(-1)
+    else if (event.type === "tool") this.textTail = ""
     const waiter = this.waiters.shift()
     if (waiter) waiter.resolve(event)
     else this.events.push(event)
@@ -656,14 +696,40 @@ class Turn {
       this.#replyText(text)
       return
     }
-    for (let keep = Math.min(text.length, AGENT_ERROR_MARKER.length - 1); keep > 0; keep--) {
-      if (AGENT_ERROR_MARKER.startsWith(text.slice(-keep))) {
-        this.heldText = text.slice(-keep)
+    const ending = this.#endingFrom(text)
+    if (ending >= 0) {
+      this.heldText = text.slice(ending)
+      this.#replyText(text.slice(0, ending))
+      return
+    }
+    for (let keep = Math.min(text.length, HOLD_MAX); keep > 0; keep--) {
+      const tail = text.slice(-keep)
+      if (AGENT_ERROR_MARKER.startsWith(tail) || ENDING_MARKERS.some((marker) => marker.startsWith(tail))) {
+        this.heldText = tail
         text = text.slice(0, -keep)
         break
       }
     }
     this.#replyText(text)
+  }
+
+  // Where one of agy's endings (ENDING_CORES) starts in text, with the newline
+  // before it: a line of its own that only whitespace follows so far. -1 when
+  // there is none.
+  #endingFrom(text) {
+    for (const core of ENDING_CORES) {
+      const at = text.lastIndexOf(core)
+      if (at < 0 || text.slice(at).trimEnd().includes("\n")) continue
+      if (at > 0 ? text[at - 1] !== "\n" : !this.#atLineStart()) continue
+      return at > 0 ? at - 1 : at
+    }
+    return -1
+  }
+
+  // Whether text that comes next starts a line of the reply.
+  #atLineStart() {
+    if (this.upstreamHold !== null) return this.upstreamHold === "" || this.upstreamHold.endsWith("\n")
+    return this.textTail === "" || this.textTail === "\n"
   }
 
   // Antigravity's quota and capacity errors can reach the bridge as the
@@ -697,6 +763,12 @@ class Turn {
   endText() {
     if (this.heldText.includes(AGENT_ERROR_CORE)) {
       this.agentError = true
+      this.heldText = ""
+      return
+    }
+    const failure = this.heldText.trim() ? classifyUpstreamFailure(this.heldText) : null
+    if (failure) {
+      this.endingFailure = failure
       this.heldText = ""
     }
   }
@@ -2362,10 +2434,10 @@ export class AgyBridge {
     proc.finalizeTurn(turn)
     turn.detach()
     const kind = error?.kind || "api_error"
-    const status = Number.isInteger(error?.status) ? error.status : kind === "rate_limit_error" ? 429 : kind === "invalid_request_error" ? 400 : 502
+    const status = errorStatus(error)
     return new Response(JSON.stringify({ type: "error", error: { type: kind, message: String(error?.message ?? error) } }), {
       status,
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", ...(error?.noRetry ? NO_RETRY_HEADERS : {}) },
     })
   }
 
@@ -2554,7 +2626,12 @@ export class AgyBridge {
               closeBlock()
               send("error", {
                 type: "error",
-                error: { type: event.error?.kind || "api_error", message: String(event.error?.message ?? event.error) },
+                error: {
+                  type: event.error?.kind || "api_error",
+                  message: String(event.error?.message ?? event.error),
+                  ...(Number.isInteger(event.error?.status) ? { status: event.error.status } : {}),
+                  ...(event.error?.noRetry ? { noRetry: true } : {}),
+                },
               })
               if (!event.error?.keepProcess) {
                 this.#dropFromPool(proc)
@@ -2690,7 +2767,7 @@ class Proc {
       "--log-file", this.logPath,
       "--ide-mcp-port", String(controlPort),
     ]
-    if (this.workDir) args.push("--add-dir", this.workDir)
+    if (this.workDir && !holdsHome(this.workDir)) args.push("--add-dir", this.workDir)
     const geminiDir = this.bridge.ensureGeminiDir()
     if (geminiDir) args.push("--gemini-dir", geminiDir)
     try {
@@ -3138,12 +3215,17 @@ class Proc {
           if (detail) throw this.#formatAgentError(detail)
         }
         turn.flushText()
-        const failure = turn.upstreamFailure()
+        const failure = turn.endingFailure || turn.upstreamFailure()
         if (failure) {
           // agy keeps the exchange in its session: never resume or reuse it
           this.historyInvalid = true
-          throw Object.assign(new Error(`agy bridge: ${failure.message}`), {
-            kind: failure.kind, status: failure.status, keepProcess: false,
+          let message = failure.message
+          if (failure.verify) {
+            const link = verifyLinkIn(await readLogTail(this.logPath, turn.logOffset))
+            if (link) message = verifyMessage(link)
+          }
+          throw Object.assign(new Error(`agy bridge: ${message}`), {
+            kind: failure.kind, status: failure.status, keepProcess: false, noRetry: !!failure.noRetry,
           })
         }
         turn.releaseUpstreamHold()
@@ -3589,10 +3671,11 @@ async function jsonResponseFromStream(stream, fallbackModel, fallbackId) {
   if (buffer.trim()) processBlock(buffer)
 
   if (streamError) {
-    const status = streamError.type === "rate_limit_error" ? 429 : 502
-    return new Response(JSON.stringify({ type: "error", error: streamError }), {
-      status,
-      headers: { "Content-Type": "application/json" },
+    const { status: _status, noRetry, ...error } = streamError
+    return new Response(JSON.stringify({ type: "error", error }), {
+      status: Number.isInteger(streamError.status) ? streamError.status
+        : streamError.type === "invalid_request_error" ? 502 : errorStatus({ kind: streamError.type }),
+      headers: { "Content-Type": "application/json", ...(noRetry ? NO_RETRY_HEADERS : {}) },
     })
   }
   return new Response(JSON.stringify(message), {

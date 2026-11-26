@@ -1,5 +1,19 @@
 import { spawn } from "node:child_process"
+import os from "node:os"
 import path from "node:path"
+
+// Whether dir is the user's home folder or a folder above it ("/", "C:\Users");
+// on Windows case aside, as the system ignores it. agy loads what a workspace
+// folder holds (AGENTS.md, skills, …) into the same budget as the client's
+// tools, so the home folder is never added as one (as the official
+// opencode-agy-cli-auth 0.1.117 does, MIT).
+export function holdsHome(dir, home = os.homedir(), platform = process.platform) {
+  if (!dir || !home) return false
+  const paths = platform === "win32" ? path.win32 : path.posix
+  const fold = (value) => platform === "win32" ? value.toLowerCase() : value
+  const rel = paths.relative(fold(paths.resolve(dir)), fold(paths.resolve(home)))
+  return rel === "" || (!rel.startsWith("..") && !paths.isAbsolute(rel))
+}
 
 export function agyCandidates(env, home, platform = process.platform) {
   const windows = platform === "win32"

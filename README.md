@@ -21,6 +21,8 @@ Long agentic sessions using the stock `@magpie-community/opencode-agy-cli-auth` 
   - Allows `session/resume` even when history contains completed `tool_result` turns.
   - Keeps the live session when the client later replaces an older image with a text note (Claude Code and Magpie do this to stay under request limits): agy already holds the image, so it is still the same conversation and its prompt cache.
   - Keeps every tool the client declares. agy passes the model at most about 60 KB of tool definitions and silently leaves out the largest tools past that; when the tools are over the limit, the longest descriptions are shortened until they fit, and their full text goes into the session's system prompt (or, for a tool added later, the next prompt).
+  - Fails the turn on agy's account and capacity endings instead of answering with them: a banned account ("This service has been disabled in this account for violation of Terms of Service", agy 1.5.9 and 1.5.10 wordings) and "Verification Required" are a `permission_error` 403 with `x-should-retry: false`, so the gateway rests that account; "Our servers are experiencing high traffic" is an `overloaded_error` 503; "Third-party quota reached" is a 429.
+  - Never adds the home folder (or a folder above it) to agy's workspace with `--add-dir`: agy would load what it holds (`AGENTS.md`, skills, …) into the same budget as the client's tools.
   - Updates dynamically added tools (`toolsGrew`) in-session via `steerInSession` + `updateTools`.
   - Deduplicates identical completed-turn HTTP retries via `CompletedTurnCache`.
   - Expands initial prompt budget to `136 KiB` on `agy >= 1.5.8` and extends idle/detached eviction windows (`IDLE_MS=30m`, `DETACHED_EVICT_MS=15m`, `TOOL_RESULT_TIMEOUT_MS=30m`).

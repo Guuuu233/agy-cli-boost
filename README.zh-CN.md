@@ -21,6 +21,8 @@
   - 允许在包含历史 `tool_result` 的对话中通过 `session/resume` 恢复完整上下文。
   - 客户端后来把较早的图片换成文字说明时（Claude Code 和 Magpie 为避免超出请求大小限制会这样做），继续沿用正在用的会话：agy 已经有这些图片，仍是同一段对话，提示词缓存照样能命中。
   - 客户端声明的工具一个不丢。agy 交给模型的工具定义最多约 60 KB，超出时会悄悄去掉最大的那几个工具；工具超限时，插件从最长的说明开始缩短直到放得下，被缩短部分的全文放进会话的系统提示（会话中途新加的工具则随下一条消息给出）。
+  - agy 报出账号或容量问题时让本轮失败，不把提示当回答发出去：封号（"This service has been disabled in this account for violation of Terms of Service"，agy 1.5.9 与 1.5.10 两种写法）和 "Verification Required" 返回 `permission_error` 403 并带 `x-should-retry: false`，网关据此停用该账号；"Our servers are experiencing high traffic" 返回 `overloaded_error` 503；"Third-party quota reached" 返回 429。
+  - 不再用 `--add-dir` 把家目录（或其上级目录）加进 agy 的工作区：agy 会把其中的 `AGENTS.md`、技能等内容载入，和客户端的工具共用同一份预算。
   - 工具列表在回合中增长（`toolsGrew`）时通过 `steerInSession` + `updateTools` 会话内热更新。
   - 通过 `CompletedTurnCache` 对已完成回合的 HTTP 重试直接去重返回。
   - `agy >= 1.5.8` 初始提示词预算提升至 `136 KiB`，并放宽空闲与脱离连接的回收窗口（`IDLE_MS=30m`、`DETACHED_EVICT_MS=15m`、`TOOL_RESULT_TIMEOUT_MS=30m`）。

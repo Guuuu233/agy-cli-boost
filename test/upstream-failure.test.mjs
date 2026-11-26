@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from "bun:test"
 import fs from "node:fs"
 import path from "node:path"
 import { startDaemon } from "../src/daemon.mjs"
-import { classifyUpstreamFailure, couldBeUpstreamFailure } from "../src/helper/upstream-failure.mjs"
+import { classifyUpstreamFailure, couldBeUpstreamFailure, verifyLinkIn } from "../src/helper/upstream-failure.mjs"
 
 const TEST_TMP_ROOT = path.resolve(import.meta.dir, "..", ".tmp-tests")
 const MOCK_AGY = path.resolve(import.meta.dir, "mock-agy.mjs")
@@ -42,6 +42,78 @@ function streamedText(sse) {
 }
 
 const QUOTA = "⚠ Individual quota reached. Your quota resets in 3h 12m."
+// agy's endings, as the official opencode-agy-cli-auth records them
+const BANNED_159 = "⚠ PERMISSION_DENIED (code 403): This service has been disabled in this account for violation of Terms of Service. Please submit an appeal to continue using this product."
+const BANNED_1510 = "⚠ This service has been disabled in this account for violation of Terms of Service. Please submit an appeal to continue using this product."
+const VERIFY = "⚠ Verification Required"
+const BUSY = "⚠ Our servers are experiencing high traffic right now, please try again in a minute. (UNAVAILABLE (code 503): No capacity available for model gemini-3.8-flash-high on the server)"
+const THIRD_PARTY = "⚠ Third-party quota reached. Please switch to Gemini models or upgrade your subscription to increase your limits. Resets in 3h22m19s."
+
+describe("agy's account and capacity endings", () => {
+  it("are classified, and a reply that only quotes one is not", () => {
+    for (const ban of [BANNED_159, BANNED_1510]) {
+      expect(classifyUpstreamFailure(ban)).toMatchObject({ kind: "permission_error", status: 403, noRetry: true })
+    }
+    expect(classifyUpstreamFailure(VERIFY)).toMatchObject({ kind: "permission_error", status: 403, noRetry: true })
+    expect(classifyUpstreamFailure(VERIFY).message).toContain("this Google account needs to be verified")
+    expect(classifyUpstreamFailure(BUSY)).toMatchObject({ kind: "overloaded_error", status: 503 })
+    expect(classifyUpstreamFailure(BUSY).noRetry).toBeUndefined()
+    expect(classifyUpstreamFailure(THIRD_PARTY)).toMatchObject({ kind: "rate_limit_error", status: 429 })
+    expect(classifyUpstreamFailure(`${BANNED_1510}\nThat is what agy prints when Google bans an account.`)).toBeNull()
+    expect(classifyUpstreamFailure(`${VERIFY}\nmeans Google wants the account verified.`)).toBeNull()
+    expect(verifyLinkIn('{"error":{"details":[{"validation_url":"https://accounts.google.com/signin/continue?x=1"}]}}'))
+      .toBe("https://accounts.google.com/signin/continue?x=1")
+    expect(verifyLinkIn("no link here")).toBe("")
+  })
+
+  for (const [name, text, status, type, noRetry] of [
+    ["a banned account (agy 1.5.9)", BANNED_159, 403, "permission_error", true],
+    ["a banned account (agy 1.5.10)", BANNED_1510, 403, "permission_error", true],
+    ["an account Google wants verified", VERIFY, 403, "permission_error", true],
+    ["a model with no capacity", BUSY, 503, "overloaded_error", false],
+    ["a used-up third-party quota", THIRD_PARTY, 429, "rate_limit_error", false],
+  ]) {
+    it(`fails the request for ${name} instead of answering with the notice`, async () => {
+      const d = await daemon()
+      for (const stream of [true, false]) {
+        const res = await ask(d, `ses_ending_${status}_${stream}_${text.length}`, `REPLY_TEXT:${text}`, { stream })
+        expect(res.status).toBe(status)
+        expect(res.headers.get("x-should-retry")).toBe(noRetry ? "false" : null)
+        const body = await res.json()
+        expect(body.error.type).toBe(type)
+      }
+    })
+  }
+
+  it("fails the turn when the ending comes after the model's own text", async () => {
+    const d = await daemon()
+    const reply = `Here is the first part of my answer.\n${BANNED_1510}`
+    const streamed = await ask(d, "ses_after_text_stream", `REPLY_TEXT:${reply}`)
+    expect(streamed.status).toBe(200)
+    const sse = await streamed.text()
+    expect(streamedText(sse)).toBe("Here is the first part of my answer.")
+    const error = sse.split("\n").filter((line) => line.startsWith("data:")).map((line) => JSON.parse(line.slice(5)))
+      .find((ev) => ev.type === "error")
+    expect(error.error).toMatchObject({ type: "permission_error", status: 403, noRetry: true })
+
+    const json = await ask(d, "ses_after_text_json", `REPLY_TEXT:${reply}`, { stream: false })
+    expect(json.status).toBe(403)
+    expect(json.headers.get("x-should-retry")).toBe("false")
+  })
+
+  it("leaves a reply alone that quotes an ending mid-line or goes on after it", async () => {
+    const d = await daemon()
+    for (const [i, reply] of [
+      `agy then prints ${VERIFY} and stops.`,
+      `${VERIFY}\nmeans Google wants the account verified.`,
+      `Answer first.\n${BANNED_1510}\nThat line is what a banned account gets.`,
+    ].entries()) {
+      const res = await ask(d, `ses_quote_${i}`, `REPLY_TEXT:${reply}`)
+      expect(res.status).toBe(200)
+      expect(streamedText(await res.text())).toBe(reply)
+    }
+  })
+})
 
 describe("upstream failure helper", () => {
   it("knows agy's quota text and leaves ordinary replies alone", () => {
